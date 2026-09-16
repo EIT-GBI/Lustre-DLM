@@ -1,0 +1,10 @@
+[project]
+name = "luster-dlm"
+version = "0.1.0"
+description = "Data Life Cycle management for Lustre and FSS"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "msgpack>=1.1.2",
+    "qpipe-rs>=1.6.0"
+]
