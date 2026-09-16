@@ -99,6 +99,7 @@ __resolve_prefix() {
 # ---- optional args: set defaults up front ----
 threads=8
 process=1
+nodes=1
 outfile="-"
 
 # ---- mandatory args: leave unset (empty) ----
@@ -114,6 +115,7 @@ Required:
 Optional:
   --threads=VALUE     number of threads    (default: ${threads})
   --process=VALUE     number of processes  (default: ${process})
+  --nodes=VALUE       number of processes  (default: ${nodes})
   --outfile=VALUE     output file to send results to (default: stdout)
   -h, --help          show this help
 EOF
@@ -126,6 +128,7 @@ while [[ $# -gt 0 ]]; do
     --outfile=*)   outfile="${1#*=}"   ;;
     --threads=*)   threads="${1#*=}"   ;;
     --process=*)   process="${1#*=}"   ;;
+    --nodes=*)     nodes="${1#*=}"     ;;
     -h|--help)     usage               ;;
     --*)           echo "Unknown option: $1" >&2; usage ;;
     *)             echo "Unexpected argument: $1" >&2; usage ;;
@@ -140,18 +143,27 @@ done
 __resolve_prefix
 __resolve_target ${__PREFIX__}/pipelines/stat.py
 
-# ---- oneshot run ----
-uv run --project=${__PREFIX__} python ${__TARGET__} bus \
-    --wait 60 &
+# ---- slurm run ----
+head_node=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -1)   
 
-for (( i=1; i<=$process; i++ ))
-do
+srun --exact -N 1 -n 1 -w $head_node                                      \
+    uv run --project=${__PREFIX__} python ${__TARGET__} bus               \
+    --wait 60                                                             \
+    --work 0.0.0.0:9101 --completions 0.0.0.0:9102 --results 0.0.0.0:9103 &
+
+srun --exact -N $nodes -n $process --exclude $head_node        \
     uv run --project=${__PREFIX__} python ${__TARGET__} worker \
-        --threads $threads --wait 60 &
-done
+        --threads $threads --wait 60                           \
+        --work $head_node:9101                                 \
+        --completions $head_node:9102                          \
+        --results $head_node:9103                              &
 
-uv run --project=${__PREFIX__} python ${__TARGET__} collect \
-    -o $outfile --wait 60 &
+srun --exact -N 1 -n 1 -w $head_node                                      \
+    uv run --project=${__PREFIX__} python ${__TARGET__} collect           \
+    -o $outfile --wait 60                                                 \
+    --work 0.0.0.0:9101 --completions 0.0.0.0:9102 --results 0.0.0.0:9103 &
 
-uv run --project=${__PREFIX__} python ${__TARGET__} coordinator \
-    $prefix --wait 60
+srun --exact -N 1 -n 1 -w $head_node                                      \
+    uv run --project=${__PREFIX__} python ${__TARGET__} coordinator       \
+    $prefix --wait 60                                                     \
+    --work 0.0.0.0:9101 --completions 0.0.0.0:9102 --results 0.0.0.0:9103 &
