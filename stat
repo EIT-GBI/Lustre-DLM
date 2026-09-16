@@ -138,7 +138,7 @@ __resolve_prefix
 __resolve_target ${__PREFIX__}/pipelines/stat.py
 
 # ---- oneshot run ----
-uv run python ${__TARGET__} bus &
-uv run python ${__TARGET__} worker --threads $threads &
-uv run python ${__TARGET__} collect -o $outfile &
-uv run python ${__TARGET__} coordinator $prefix
+uv run --project=${__PREFIX__} python ${__TARGET__} bus &
+uv run --project=${__PREFIX__} python ${__TARGET__} worker --threads $threads &
+uv run --project=${__PREFIX__} python ${__TARGET__} collect -o $outfile &
+uv run --project=${__PREFIX__} python ${__TARGET__} coordinator $prefix
