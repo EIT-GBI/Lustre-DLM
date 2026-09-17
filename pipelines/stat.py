@@ -55,7 +55,7 @@ def scan(spec: Spec, result: Emit, discover: Discover) -> None:
         try:
             result(object_record(f.name, str(f), 0, f.lstat()))
         except:
-            result(object_record(f.name, str(f), 0, []))
+            result(object_record(f.name, str(f), 1, []))
 
     result(object_record(parent.name, str(parent), parent.lstat()))
 
