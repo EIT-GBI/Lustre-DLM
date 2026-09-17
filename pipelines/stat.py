@@ -55,7 +55,7 @@ def scan(spec: Spec, result: Emit, discover: Discover) -> None:
         try:
             result(object_record(f.name, str(f), 0, f.lstat()))
         except:
-            result(object_record(f.name, str(f), 1, []))
+            result(object_record(f.name, str(f), 1, object()))
 
     result(object_record(parent.name, str(parent), parent.lstat()))
 
@@ -84,7 +84,7 @@ def make_coordinator(args: argparse.Namespace) -> Coordinator:
         )
 
     return Coordinator(
-        seeds=seeds, expand=expand, key_of=lambda s: s["path"]
+        seeds=seeds, expand=expand, key_of=lambda s: s["path"], dedup="parent"
     )
 
 
