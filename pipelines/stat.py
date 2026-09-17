@@ -19,14 +19,15 @@ from qpipe.work import (
 FIELDS = ("st_size", "st_atime", "st_mtime", "st_ctime")
 
 
-def object_record(name: str, path:str, obj: Any) -> dict[str, Any]:
+def object_record(name: str, path:str, code:int, obj: Any) -> dict[str, Any]:
     """
     ObjectSummary →  plain dict containing only the fields the listing
     populated.
     """
     rec: dict[str, Any] = {
         "name": name,
-        "path": path
+        "path": path,
+        "code": code
     }
 
     for attr in FIELDS:
@@ -52,9 +53,9 @@ def scan(spec: Spec, result: Emit, discover: Discover) -> None:
 
     for f in cfiles:
         try:
-            result(object_record(f.name, str(f), f.lstat()))
+            result(object_record(f.name, str(f), 0, f.lstat()))
         except:
-            pass
+            result(object_record(f.name, str(f), 0, []))
 
     result(object_record(parent.name, str(parent), parent.lstat()))
 
