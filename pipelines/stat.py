@@ -54,10 +54,10 @@ def scan(spec: Spec, result: Emit, discover: Discover) -> None:
         except:
             result(object_record(f.name, str(f), 1, object()))
 
-    result(object_record(parent.name, str(parent), parent.lstat()))
-
     if cdirs:
         discover({"children": cdirs})
+
+    result(object_record(parent.name, str(parent), parent.lstat()))
 
 
 def make_coordinator(args: argparse.Namespace) -> Coordinator:
