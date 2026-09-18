@@ -48,9 +48,6 @@ def scan(spec: Spec, result: Emit, discover: Discover) -> None:
     cdirs    = [str(x) for x in children if x.is_dir(follow_symlinks=False)]
     cfiles   = [x      for x in children if not x.is_dir(follow_symlinks=False)]
 
-    if cdirs:
-        discover({"children": cdirs})
-
     for f in cfiles:
         try:
             result(object_record(f.name, str(f), 0, f.lstat()))
@@ -58,6 +55,9 @@ def scan(spec: Spec, result: Emit, discover: Discover) -> None:
             result(object_record(f.name, str(f), 1, object()))
 
     result(object_record(parent.name, str(parent), parent.lstat()))
+
+    if cdirs:
+        discover({"children": cdirs})
 
 
 def make_coordinator(args: argparse.Namespace) -> Coordinator:
