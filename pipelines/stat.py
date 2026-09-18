@@ -57,6 +57,7 @@ def scan(spec: Spec, result: Emit, discover: Discover) -> None:
     if cdirs:
         discover({"children": cdirs})
 
+    # This completes the current task
     result(object_record(parent.name, str(parent), parent.lstat()))
 
 
