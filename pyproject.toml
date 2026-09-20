@@ -6,5 +6,5 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "msgpack>=1.1.2",
-    "qpipe-rs>=1.8.0"
+    "qpipe-rs>=1.8.1"
 ]

@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import argparse
 
 from collections.abc import Iterable, Iterator
-from dataclasses     import dataclass
 from pathlib         import Path
-from typing          import Any, Literal
+from typing          import Any
 
+from qpipe import QpipeError
 from qpipe.work import (
     Coordinator, Discover, Discovery, Emit, Job, Permanent, Pipeline, Pipes,
     Spec, Worker, run
 )
 
+
+# subdirectories per beget frame
+DISCOVER_EVERY = 10_000
 
 FIELDS = ("st_size", "st_atime", "st_mtime", "st_ctime")
 
@@ -40,25 +44,43 @@ def object_record(name: str, path:str, code:int, obj: Any) -> dict[str, Any]:
 
 def scan(spec: Spec, result: Emit, discover: Discover) -> None:
     """
-    Stat one folder's content. Return stats; and discover more work (by way of
-    child directories)
+    Stat one directory's contents, streaming: one readdir, one lstat per entry,
+    O(1) memory in files and O(DISCOVER_EVERY) in subdirectories.
     """
-    parent   = Path(spec.get("path", "."))
-    children = [x      for x in parent.iterdir()]
-    cdirs    = [str(x) for x in children if x.is_dir(follow_symlinks=False)]
-    cfiles   = [x      for x in children if not x.is_dir(follow_symlinks=False)]
+    path = spec.get("path", ".")
 
-    for f in cfiles:
-        try:
-            result(object_record(f.name, str(f), 0, f.lstat()))
-        except:
-            result(object_record(f.name, str(f), 1, object()))
+    try:
+        it = os.scandir(path)
+    except OSError as err:
+        raise Permanent(f"cannot list '{path}': {err}") from err
+
+    def batch_discover(e: Path, cdirs: list[str]):
+        cdirs.append(e.path)
+        if len(cdirs) >= DISCOVER_EVERY:
+            discover({"children": cdirs})
+            cdirs = []
+
+    cdirs: list[str] = []
+    with it:
+        for e in it:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    batch_discover(e, cdirs)
+                    continue
+                result(object_record(
+                    e.name, e.path, 0, e.stat(follow_symlinks=False)
+                ))
+            except QpipeError:
+                # pipe is gone: the harness must see it
+                raise
+            except OSError:
+                result(object_record(e.name, e.path, 1, object()))
 
     if cdirs:
         discover({"children": cdirs})
 
     # This completes the current task
-    result(object_record(parent.name, str(parent), parent.lstat()))
+    result(object_record(os.path.basename(path), path, 0, os.lstat(path)))
 
 
 def make_coordinator(args: argparse.Namespace) -> Coordinator:
@@ -98,10 +120,7 @@ def make_worker(args: argparse.Namespace) -> Worker:
             _state: NoneType, job: Job, result: Emit, discover: Discover
         ) -> None:
         """Scan one prefix."""
-        try:
-            scan(job.spec, result, discover)
-        except:
-            pass
+        scan(job.spec, result, discover)
 
     return Worker(setup=lambda: None, process=process)
 
