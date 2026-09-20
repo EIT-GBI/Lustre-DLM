@@ -54,24 +54,20 @@ def scan(spec: Spec, result: Emit, discover: Discover) -> None:
     except OSError as err:
         raise Permanent(f"cannot list '{path}': {err}") from err
 
-    def batch_discover(e: Path, cdirs: list[str]):
-        cdirs.append(e.path)
-        if len(cdirs) >= DISCOVER_EVERY:
-            discover({"children": cdirs})
-            cdirs = []
-
     cdirs: list[str] = []
     with it:
         for e in it:
             try:
                 if e.is_dir(follow_symlinks=False):
-                    batch_discover(e, cdirs)
+                    cdirs.append(e.path)
+                    if len(cdirs) >= DISCOVER_EVERY:
+                        discover({"children": cdirs})
+                        cdirs = []
                     continue
                 result(object_record(
                     e.name, e.path, 0, e.stat(follow_symlinks=False)
                 ))
             except QpipeError:
-                # pipe is gone: the harness must see it
                 raise
             except OSError:
                 result(object_record(e.name, e.path, 1, object()))
