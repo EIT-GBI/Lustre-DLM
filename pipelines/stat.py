@@ -7,6 +7,7 @@ import sys
 import argparse
 
 from collections.abc import Iterable, Iterator
+from itertools       import batched
 from pathlib         import Path
 from typing          import Any
 
@@ -42,40 +43,37 @@ def object_record(name: str, path:str, code:int, obj: Any) -> dict[str, Any]:
     return rec
 
 
-def scan(spec: Spec, result: Emit, discover: Discover) -> None:
+def subdirs(it, result: Emit) -> Iterator[str]:
     """
-    Stat one directory's contents, streaming: one readdir, one lstat per entry,
-    O(1) memory in files and O(DISCOVER_EVERY) in subdirectories.
+    Stream one directory: emit a record per non-directory entry as it goes,
+    and yield each subdirectory's path for the caller to batch.
     """
-    path = spec.get("path", ".")
+    for e in it:
+        try:
+            if e.is_dir(follow_symlinks=False):
+                yield e.path
+                continue
+            result(object_record(
+                e.name, e.path, 0, e.stat(follow_symlinks=False)
+            ))
+        except QpipeError:
+            raise                        # pipe is gone: the harness must see it
+        except OSError:
+            result(object_record(e.name, e.path, 1, object()))
 
+
+def scan(spec: Spec, result: Emit, discover: Discover) -> None:
+    """One readdir, one lstat per entry; at most DISCOVER_EVERY paths held."""
+    path = spec.get("path", ".")
     try:
         it = os.scandir(path)
     except OSError as err:
         raise Permanent(f"cannot list '{path}': {err}") from err
 
-    cdirs: list[str] = []
     with it:
-        for e in it:
-            try:
-                if e.is_dir(follow_symlinks=False):
-                    cdirs.append(e.path)
-                    if len(cdirs) >= DISCOVER_EVERY:
-                        discover({"children": cdirs})
-                        cdirs = []
-                    continue
-                result(object_record(
-                    e.name, e.path, 0, e.stat(follow_symlinks=False)
-                ))
-            except QpipeError:
-                raise
-            except OSError:
-                result(object_record(e.name, e.path, 1, object()))
+        for chunk in batched(subdirs(it, result), DISCOVER_EVERY):
+            discover({"children": list(chunk)})
 
-    if cdirs:
-        discover({"children": cdirs})
-
-    # This completes the current task
     result(object_record(os.path.basename(path), path, 0, os.lstat(path)))
 
 
