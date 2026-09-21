@@ -1,0 +1,14 @@
+name = "App"
+uuid = "bb7a544a-c9f7-4694-83d9-288413a25515"
+version = "0.1.0"
+authors = ["Johannes Blaschke <johannes.blaschke@gmail.com>"]
+
+[deps]
+PackageCompiler = "9b87118b-4619-50d2-8e1e-99f35a4d4d9d"
+ProcessStat = "71e27c76-8f17-466a-9f3d-dbe556fc2ffb"
+
+[sources]
+ProcessStat = {path = ".."}
+
+[compat]
+PackageCompiler = "2.4.3"

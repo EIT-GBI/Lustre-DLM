@@ -19,7 +19,7 @@ from qpipe.work import (
 
 
 # subdirectories per beget frame
-DISCOVER_EVERY = 10_000
+DISCOVER_EVERY = 1_000_000
 
 FIELDS = ("st_size", "st_atime", "st_mtime", "st_ctime")
 
