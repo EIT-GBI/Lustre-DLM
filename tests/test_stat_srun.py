@@ -28,14 +28,18 @@ def fake_slurm(tmp_path: Path) -> tuple[Path, Path]:
             raise SystemExit(143)
 
         signal.signal(signal.SIGTERM, stop)
+        status = int(os.environ.get(role.upper() + '_STATUS', '0'))
         if role == 'coordinator':
             time.sleep(float(os.environ.get('COORD_DELAY', '0.1')))
-            raise SystemExit(int(os.environ.get('COORD_STATUS', '0')))
+            raise SystemExit(status)
         if role == 'collect':
             time.sleep(float(os.environ.get('COLLECT_DELAY', '0.1')))
-            with open(os.environ['COLLECT_MARKER'], 'w') as stream:
-                stream.write('complete')
-            raise SystemExit(0)
+            if status == 0:
+                with open(os.environ['COLLECT_MARKER'], 'w') as stream:
+                    stream.write('complete')
+            raise SystemExit(status)
+        if status:
+            raise SystemExit(status)
         while True:
             time.sleep(0.05)
     """).lstrip())
@@ -44,7 +48,7 @@ def fake_slurm(tmp_path: Path) -> tuple[Path, Path]:
     return bin_dir, bin_dir / "srun"
 
 
-def invoke(tmp_path: Path, *, coordinator_status: int = 0) -> tuple[subprocess.CompletedProcess, Path]:
+def invoke(tmp_path: Path, *, coordinator_status: int = 0, collector_status: int = 0, worker_status: int = 0) -> tuple[subprocess.CompletedProcess, Path]:
     bin_dir, _ = fake_slurm(tmp_path)
     log = tmp_path / "events.log"
     marker = tmp_path / "collector.done"
@@ -54,7 +58,9 @@ def invoke(tmp_path: Path, *, coordinator_status: int = 0) -> tuple[subprocess.C
         "SLURM_JOB_NODELIST": "fake-node",
         "FAKE_LOG": str(log),
         "COLLECT_MARKER": str(marker),
-        "COORD_STATUS": str(coordinator_status),
+        "COORDINATOR_STATUS": str(coordinator_status),
+        "COLLECT_STATUS": str(collector_status),
+        "WORKER_STATUS": str(worker_status),
         "COLLECT_DELAY": "0.2",
     })
     result = subprocess.run(
@@ -82,3 +88,57 @@ def test_coordinator_failure_is_returned_and_services_are_cleaned(tmp_path: Path
     assert "term:worker" in events
     assert "term:collect" in events
     assert not (tmp_path / "collector.done").exists()
+
+
+def test_collector_failure_is_returned_and_services_are_cleaned(tmp_path: Path):
+    result, log = invoke(tmp_path, collector_status=19)
+    assert result.returncode == 19
+    events = log.read_text().splitlines()
+    assert "term:bus" in events
+    assert "term:worker" in events
+
+
+def test_early_worker_failure_is_returned(tmp_path: Path):
+    result, log = invoke(tmp_path, worker_status=23)
+    assert result.returncode == 23
+    events = log.read_text().splitlines()
+    assert "term:bus" in events
+    assert "term:coordinator" in events
+    assert "term:collect" in events
+
+
+def test_sigterm_cleans_owned_jobs_but_not_unrelated_process(tmp_path: Path):
+    bin_dir, _ = fake_slurm(tmp_path)
+    log = tmp_path / "events.log"
+    marker = tmp_path / "collector.done"
+    sentinel = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    env = os.environ.copy()
+    env.update({
+        "PATH": f"{bin_dir}:{env['PATH']}",
+        "SLURM_JOB_NODELIST": "fake-node",
+        "FAKE_LOG": str(log),
+        "COLLECT_MARKER": str(marker),
+        "COORD_DELAY": "10",
+        "COLLECT_DELAY": "10",
+    })
+    process = subprocess.Popen(
+        [str(LAUNCHER), f"--prefix={tmp_path}", "--outfile=/dev/null"],
+        env=env, text=True,
+    )
+    try:
+        for _ in range(100):
+            if log.exists() and "start:coordinator" in log.read_text():
+                break
+            import time
+            time.sleep(0.02)
+        process.terminate()
+        assert process.wait(timeout=5) == 143
+        assert sentinel.poll() is None
+        events = log.read_text().splitlines()
+        assert "term:bus" in events
+        assert "term:worker" in events
+        assert "term:collect" in events
+        assert "term:coordinator" in events
+    finally:
+        sentinel.terminate()
+        sentinel.wait(timeout=5)
