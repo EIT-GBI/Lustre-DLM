@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Publish a private directory summary from an explicitly completed inventory."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import closing
+from datetime import datetime, timezone
+import os
+from pathlib import Path, PurePosixPath
+import sqlite3
+import stat
+import sys
+import tempfile
+
+
+SCHEMA = """
+CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE directories (
+    path TEXT PRIMARY KEY, parent_path TEXT NOT NULL,
+    apparent_bytes INTEGER NOT NULL, entries INTEGER NOT NULL
+);
+CREATE INDEX directories_parent ON directories(parent_path, apparent_bytes DESC, path);
+"""
+
+
+def source_files(source: Path) -> list[Path]:
+    if source.is_file() and source.suffix.lower() in {".parquet", ".jsonl"}:
+        return [source]
+    if source.is_dir():
+        files = sorted(path for path in source.rglob("*.parquet") if path.is_file())
+        if files:
+            return files
+    raise ValueError("input must be completed JSONL, Parquet, or a Parquet dataset directory")
+
+
+def signatures(files):
+    return [(str(path), info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+            for path in files for info in [path.stat()]]
+
+
+def check_output(destination):
+    directory = destination.parent.stat()
+    if directory.st_uid != os.getuid() or directory.st_mode & 0o022:
+        raise ValueError("output directory must be caller-owned and not writable by others")
+    try:
+        info = destination.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        raise ValueError("existing output must be a regular file owned by the caller")
+
+
+def ensure_directory(db, path):
+    """Create inferred ancestors without assuming the inventory listed each one."""
+    while True:
+        parent = "" if path == "." else str(PurePosixPath(path).parent)
+        db.execute("INSERT OR IGNORE INTO directories VALUES (?, ?, 0, 0)", (path, parent))
+        if path == ".":
+            return
+        path = parent
+
+
+def aggregate(db, files, root, scratch):
+    try:
+        import duckdb
+    except ImportError as error:
+        raise ValueError("install the optional producer dependency: duckdb") from error
+    # Only directory groups cross into Python. Larger grouping operations can
+    # spill into the private temporary directory instead of growing RAM.
+    with duckdb.connect(config={"threads": 2, "memory_limit": "512MB",
+                                "temp_directory": str(scratch)}) as source:
+        names = [str(path) for path in files]
+        if files[0].suffix.lower() == ".jsonl":
+            source.read_json(names, format="newline_delimited", columns={
+                "path": "VARCHAR", "st_size": "BIGINT", "code": "BIGINT",
+            }).create_view("inventory")
+        else:
+            source.read_parquet(names).create_view("inventory")
+        columns = {row[0] for row in source.execute("DESCRIBE inventory").fetchall()}
+        if not {"path", "st_size", "code"}.issubset(columns):
+            raise ValueError("inventory needs path, st_size and code columns")
+        source.execute("CREATE TEMP TABLE selected AS SELECT path, st_size, code FROM inventory "
+                       "WHERE path = ? OR starts_with(path, ?)", [root, root + "/"])
+        invalid = source.execute("""
+            SELECT count(*) FROM selected WHERE code IS NULL OR code <> 0
+                OR st_size IS NULL OR st_size < 0
+                OR contains(path, '//') OR contains(path, '/./') OR contains(path, '/../')
+                OR ends_with(path, '/.') OR ends_with(path, '/..') OR ends_with(path, '/')
+        """).fetchone()[0]
+        if invalid:
+            raise ValueError(f"selected inventory has {invalid} failed or invalid entries")
+        count, total = source.execute("SELECT count(*), sum(st_size) FROM selected").fetchone()
+        if not count:
+            raise ValueError("inventory contains no entries for the selected root")
+        # A path with descendants is a directory. Count its own metadata there;
+        # entries without descendants belong to their parent. Empty directories
+        # cannot be distinguished from files in the scanner's existing schema.
+        cursor = source.execute("""
+            WITH parents AS (
+                SELECT DISTINCT regexp_replace(path, '/[^/]*$', '') AS path
+                FROM selected WHERE path <> ?
+            )
+            SELECT CASE WHEN entry.path = ? OR parent.path IS NOT NULL THEN entry.path
+                        ELSE regexp_replace(entry.path, '/[^/]*$', '') END AS directory,
+                   sum(st_size), count(*)
+            FROM selected entry LEFT JOIN parents parent ON entry.path = parent.path
+            GROUP BY 1
+        """, [root, root])
+        while batch := cursor.fetchmany(1000):
+            for directory, size, entries in batch:
+                relative = PurePosixPath(directory).relative_to(root).as_posix()
+                ensure_directory(db, relative)
+                db.execute("UPDATE directories SET apparent_bytes=apparent_bytes+?, "
+                           "entries=entries+? WHERE path=?", (int(size), entries, relative))
+    # Children always have longer paths than their parents. Read current totals
+    # after children contribute and add each subtree to its parent once.
+    paths = db.execute("SELECT path, parent_path FROM directories WHERE path <> '.' "
+                       "ORDER BY length(path) DESC")
+    for path, parent in paths:
+        size, entries = db.execute("SELECT apparent_bytes, entries FROM directories WHERE path=?",
+                                   (path,)).fetchone()
+        db.execute("UPDATE directories SET apparent_bytes=apparent_bytes+?, entries=entries+? "
+                   "WHERE path=?", (size, entries, parent))
+    observed = db.execute("SELECT apparent_bytes, entries FROM directories WHERE path='.'").fetchone()
+    if observed != (int(total), count):
+        raise ValueError("directory totals do not reconcile with the source")
+    return count, int(total)
+
+
+def publish(args):
+    temporary = None
+    try:
+        if not args.completed:
+            raise ValueError("use --completed only after the inventory job has finished successfully")
+        stamp = datetime.fromisoformat(args.snapshot_at.replace("Z", "+00:00"))
+        if stamp.tzinfo is None or stamp > datetime.now(timezone.utc):
+            raise ValueError("snapshot time must include a timezone and must not be in the future")
+        root = Path(os.path.abspath(args.root))
+        root.stat()
+        if not root.is_dir() or root.stat().st_uid != os.getuid() or root == Path("/"):
+            raise ValueError("root must be an existing directory owned by the caller")
+        source = Path(os.path.abspath(args.input))
+        source.stat()
+        destination = Path(args.output or Path.home() / ".gbi" / "usage.sqlite3").expanduser().absolute()
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        check_output(destination)
+        files = source_files(source)
+        if destination.resolve() in files:
+            raise ValueError("source and output must differ")
+        before = signatures(files)
+        fd, temporary = tempfile.mkstemp(prefix=".usage-", suffix=".sqlite3", dir=destination.parent)
+        os.close(fd)
+        with tempfile.TemporaryDirectory(prefix=".usage-work-") as scratch:
+            with closing(sqlite3.connect(temporary)) as db:
+                db.executescript(SCHEMA)
+                count, total = aggregate(db, files, str(root), scratch)
+                if before != signatures(source_files(source)):
+                    raise ValueError("source changed during publication")
+                metadata = {
+                    "schema_version": "1", "owner_uid": str(os.getuid()), "root": str(root),
+                    "status": "complete", "complete_input": "true",
+                    "snapshot_at": stamp.isoformat(),
+                    "published_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "source": str(source), "entries": str(count), "apparent_bytes": str(total),
+                }
+                db.executemany("INSERT INTO metadata VALUES (?, ?)", metadata.items())
+                db.commit()
+        check_output(destination)
+        os.replace(temporary, destination)
+        print(destination)
+        return 0
+    except Exception as error:
+        # DuckDB has its own parse/I/O exceptions. Every failed generation must
+        # return failure while keeping the last successfully published report.
+        print(f"usage: publication failed; previous report retained: {error}", file=sys.stderr)
+        return 2
+    finally:
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", required=True, help="completed JSONL, Parquet, or Parquet dataset directory")
+    parser.add_argument("--root", required=True, help="your own canonical Lustre directory")
+    parser.add_argument("--output", help="private SQLite report (default: ~/.gbi/usage.sqlite3)")
+    parser.add_argument("--completed", action="store_true", help="confirm the inventory job finished successfully")
+    parser.add_argument("--snapshot-at", required=True, help="original inventory timestamp with timezone, not conversion time")
+    return publish(parser.parse_args())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

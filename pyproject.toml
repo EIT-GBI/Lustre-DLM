@@ -8,3 +8,6 @@ dependencies = [
     "msgpack>=1.1.2",
     "qpipe-rs>=1.8.1"
 ]
+
+[project.optional-dependencies]
+usage = ["duckdb>=1.1"]
