@@ -150,20 +150,108 @@ srun --exact -N 1 -n 1 -w $head_node                                      \
     uv run --project=${__PREFIX__} python ${__TARGET__} bus               \
     --wait 60                                                             \
     --work 0.0.0.0:9101 --completions 0.0.0.0:9102 --results 0.0.0.0:9103 &
+bus_pid=$!
 
 srun --exact -N $nodes -n $process --exclude $head_node        \
     uv run --project=${__PREFIX__} python ${__TARGET__} worker \
         --threads $threads --wait 60                           \
         --work $head_node:9101                                 \
         --completions $head_node:9102                          \
-        --results $head_node:9103                              &
+    --results $head_node:9103                              &
+worker_pid=$!
 
 srun --exact -N 1 -n 1 -w $head_node                                      \
     uv run --project=${__PREFIX__} python ${__TARGET__} collect           \
     -o $outfile --wait 60                                                 \
     --work 0.0.0.0:9101 --completions 0.0.0.0:9102 --results 0.0.0.0:9103 &
+collector_pid=$!
 
-srun --exact -N 1 -n 1 -w $head_node                                      \
+is_active() {
+    [ -n "$1" ] && kill -0 "$1" 2>/dev/null
+}
+
+terminate_owned() {
+    for pid in "$bus_pid" "$worker_pid" "$collector_pid" "$coordinator_pid"; do
+        if is_active "$pid"; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+}
+
+cleanup() {
+    status=$?
+    trap - EXIT INT TERM
+    terminate_owned
+    for pid in "$bus_pid" "$worker_pid" "$collector_pid" "$coordinator_pid"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    exit "$status"
+}
+on_interrupt() { exit 130; }
+on_terminate() { exit 143; }
+trap cleanup EXIT
+trap on_interrupt INT
+trap on_terminate TERM
+
+coordinator_pid=""
+coord_done=0
+collector_done=0
+bus_done=0
+worker_done=0
+coordinator_status=0
+collector_status=0
+bus_status=0
+worker_status=0
+
+srun --exact -N 1 -n 1 -w "$head_node"                         \
     uv run --project=${__PREFIX__} python ${__TARGET__} coordinator       \
-    $prefix --wait 60                                                     \
+    "$prefix" --wait 60                                                   \
     --work 0.0.0.0:9101 --completions 0.0.0.0:9102 --results 0.0.0.0:9103 &
+coordinator_pid=$!
+
+reap_role() {
+    role_pid=$1
+    role_done=$2
+    role_status=$3
+    role_variable=$4
+    if [ "$(eval "printf '%s' \"\$$role_done\"")" -eq 0 ] && ! is_active "$role_pid"; then
+        if wait "$role_pid"; then
+            code=0
+        else
+            code=$?
+        fi
+        eval "$role_status=$code"
+        eval "$role_done=1"
+        eval "$role_variable=''"
+    fi
+}
+
+while :; do
+    reap_role "$coordinator_pid" coord_done coordinator_status coordinator_pid
+    reap_role "$collector_pid" collector_done collector_status collector_pid
+    reap_role "$bus_pid" bus_done bus_status bus_pid
+    reap_role "$worker_pid" worker_done worker_status worker_pid
+
+    if [ "$coordinator_status" -ne 0 ] || [ "$collector_status" -ne 0 ] || \
+       [ "$bus_status" -ne 0 ] || [ "$worker_status" -ne 0 ]; then
+        break
+    fi
+    if [ "$coord_done" -eq 1 ] && [ "$collector_done" -eq 1 ]; then
+        break
+    fi
+    sleep 0.1
+done
+
+if [ "$coordinator_status" -ne 0 ]; then
+    exit "$coordinator_status"
+fi
+if [ "$collector_status" -ne 0 ]; then
+    exit "$collector_status"
+fi
+if [ "$bus_status" -ne 0 ]; then
+    exit "$bus_status"
+fi
+if [ "$worker_status" -ne 0 ]; then
+    exit "$worker_status"
+fi
+exit 0
