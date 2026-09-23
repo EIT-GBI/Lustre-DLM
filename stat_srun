@@ -166,14 +166,12 @@ srun --exact -N 1 -n 1 -w $head_node                                      \
     --work 0.0.0.0:9101 --completions 0.0.0.0:9102 --results 0.0.0.0:9103 &
 collector_pid=$!
 
-children="$bus_pid $worker_pid $collector_pid"
-
 is_active() {
     [ -n "$1" ] && kill -0 "$1" 2>/dev/null
 }
 
 terminate_owned() {
-    for pid in $children "$coordinator_pid"; do
+    for pid in "$bus_pid" "$worker_pid" "$collector_pid" "$coordinator_pid"; do
         if is_active "$pid"; then
             kill "$pid" 2>/dev/null || true
         fi
@@ -184,7 +182,7 @@ cleanup() {
     status=$?
     trap - EXIT INT TERM
     terminate_owned
-    for pid in $children "$coordinator_pid"; do
+    for pid in "$bus_pid" "$worker_pid" "$collector_pid" "$coordinator_pid"; do
         wait "$pid" 2>/dev/null || true
     done
     exit "$status"
@@ -215,6 +213,7 @@ reap_role() {
     role_pid=$1
     role_done=$2
     role_status=$3
+    role_variable=$4
     if [ "$(eval "printf '%s' \"\$$role_done\"")" -eq 0 ] && ! is_active "$role_pid"; then
         if wait "$role_pid"; then
             code=0
@@ -223,14 +222,15 @@ reap_role() {
         fi
         eval "$role_status=$code"
         eval "$role_done=1"
+        eval "$role_variable=''"
     fi
 }
 
 while :; do
-    reap_role "$coordinator_pid" coord_done coordinator_status
-    reap_role "$collector_pid" collector_done collector_status
-    reap_role "$bus_pid" bus_done bus_status
-    reap_role "$worker_pid" worker_done worker_status
+    reap_role "$coordinator_pid" coord_done coordinator_status coordinator_pid
+    reap_role "$collector_pid" collector_done collector_status collector_pid
+    reap_role "$bus_pid" bus_done bus_status bus_pid
+    reap_role "$worker_pid" worker_done worker_status worker_pid
 
     if [ "$coordinator_status" -ne 0 ] || [ "$collector_status" -ne 0 ] || \
        [ "$bus_status" -ne 0 ] || [ "$worker_status" -ne 0 ]; then

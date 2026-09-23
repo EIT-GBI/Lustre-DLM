@@ -61,7 +61,7 @@ def invoke(tmp_path: Path, *, coordinator_status: int = 0, collector_status: int
         "COORDINATOR_STATUS": str(coordinator_status),
         "COLLECT_STATUS": str(collector_status),
         "WORKER_STATUS": str(worker_status),
-        "COLLECT_DELAY": "0.2",
+        "COLLECT_DELAY": "0.5",
     })
     result = subprocess.run(
         [str(LAUNCHER), f"--prefix={tmp_path}", "--outfile=/dev/null"],
@@ -76,6 +76,8 @@ def test_waits_for_collector_and_cleans_owned_services(tmp_path: Path):
     events = log.read_text().splitlines()
     assert "start:coordinator" in events
     assert (tmp_path / "collector.done").read_text() == "complete"
+    assert "term:coordinator" not in events
+    assert "term:collect" not in events
     assert "term:bus" in events
     assert "term:worker" in events
 
