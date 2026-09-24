@@ -57,6 +57,25 @@ def test_rollup_literal_paths_and_foreign_root_filter(tmp_path: Path):
         assert db.execute("SELECT apparent_bytes FROM directories WHERE path=?", ("weird%_dir",)).fetchone() == (7,)
 
 
+def test_selected_inventory_is_lazy_and_treats_root_literally(tmp_path: Path):
+    con = duckdb.connect()
+    con.execute("CREATE TABLE inventory(path VARCHAR, st_size BIGINT, code INTEGER)")
+    root = "/ali'ce%_"
+    con.executemany("INSERT INTO inventory VALUES (?, ?, ?)", [
+        (root, 100, 0), (root + "/a", 10, 0), (root + "-other/b", 999, 0),
+    ])
+    usage.select_inventory(con, root)
+    assert con.execute("SELECT path FROM selected ORDER BY path").fetchall() == [
+        (root,), (root + "/a",)
+    ]
+    assert con.execute("SELECT view_name FROM duckdb_views() WHERE view_name='selected'").fetchone() == ("selected",)
+    con.execute("INSERT INTO inventory VALUES (?, ?, ?)", (root + "/new", 4, 0))
+    assert con.execute("SELECT path FROM selected ORDER BY path").fetchall() == [
+        (root,), (root + "/a",), (root + "/new",)
+    ]
+    con.close()
+
+
 def test_errors_preserve_previous_complete(tmp_path: Path):
     root = tmp_path / "alice"
     root.mkdir()

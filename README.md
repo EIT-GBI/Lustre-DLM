@@ -23,8 +23,12 @@ python pipelines/usage.py \
 Use the original scan's timestamp, not the later conversion time. Parquet
 input can be one file or a dataset directory; an already partitioned user
 subset avoids reading other partitions. JSONL is supported directly when no
-conversion exists. Its full input is read once during publication, so run a
-large publication on an allocated CPU worker. The default output is
+conversion exists. Publication reads the input for validation and aggregation, so run a
+large publication on an allocated CPU worker. The owner-root selection is a
+DuckDB view over that input rather than a second materialized copy; DuckDB's
+configured limit applies to its managed execution memory, while row-group
+decoding and the operating system can still add overhead. Grouping work can
+spill to the private temporary directory. The default output is
 `~/.gbi/usage.sqlite3`; GBI normally reads the same path in the user's FSS home.
 
 A scheduled scan can call this command **after** its coordinator and collector

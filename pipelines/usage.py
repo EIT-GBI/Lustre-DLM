@@ -61,6 +61,18 @@ def ensure_directory(db, path):
         path = parent
 
 
+def select_inventory(source, root):
+    """Expose the selected source rows without materializing the full subset."""
+    import duckdb
+
+    path = duckdb.ColumnExpression("path")
+    selected = source.table("inventory").filter(
+        (path == duckdb.ConstantExpression(root))
+        | duckdb.FunctionExpression("starts_with", path, duckdb.ConstantExpression(root + "/"))
+    )
+    selected.project("path, st_size, code").create_view("selected")
+
+
 def aggregate(db, files, root, scratch):
     try:
         import duckdb
@@ -80,8 +92,7 @@ def aggregate(db, files, root, scratch):
         columns = {row[0] for row in source.execute("DESCRIBE inventory").fetchall()}
         if not {"path", "st_size", "code"}.issubset(columns):
             raise ValueError("inventory needs path, st_size and code columns")
-        source.execute("CREATE TEMP TABLE selected AS SELECT path, st_size, code FROM inventory "
-                       "WHERE path = ? OR starts_with(path, ?)", [root, root + "/"])
+        select_inventory(source, root)
         invalid = source.execute("""
             SELECT count(*) FROM selected WHERE code IS NULL OR code <> 0
                 OR st_size IS NULL OR st_size < 0
