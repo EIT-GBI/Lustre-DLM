@@ -4,7 +4,7 @@ Data Lifecycle Management Utilities for Lustre and FSS.
 
 ## Fast folder reports for GBI
 
-`gbi data usage` reads a small indexed summary instead of walking Lustre or
+`gbi data usage` reads an indexed folder summary instead of walking Lustre or
 parsing the full inventory on every request. `pipelines/usage.py` creates that
 summary from a **completed** scanner JSONL or Parquet inventory. It does not
 start a scan, install a schedule, change quotas, or tag project IDs.
@@ -26,9 +26,10 @@ subset avoids reading other partitions. JSONL is supported directly when no
 conversion exists. Publication reads the input for validation and aggregation, so run a
 large publication on an allocated CPU worker. The command reports each
 publication phase while it runs. The owner-root selection is a
-DuckDB view over that input rather than a second materialized copy. Distinct
-parent paths are grouped separately before the final join and aggregation;
-publication uses one DuckDB thread and does not preserve input row order.
+DuckDB view over that input rather than a second materialized copy. Parent
+totals are grouped into private temporary Parquet, then directory metadata is
+assigned separately. This avoids combining a large join and grouping operation.
+Publication uses one DuckDB thread and does not preserve input row order.
 DuckDB's configured limit applies to its managed execution memory, while row-group
 decoding and the operating system can still add overhead. Grouping work can
 spill to the private temporary directory. The SQLite folder index is built

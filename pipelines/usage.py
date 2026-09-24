@@ -107,25 +107,21 @@ def aggregate(db, files, root, scratch):
         count, total = source.execute("SELECT count(*), sum(st_size) FROM selected").fetchone()
         if not count:
             raise ValueError("inventory contains no entries for the selected root")
-        # A path with descendants is a directory. Count its own metadata there;
-        # entries without descendants belong to their parent. Empty directories
-        # cannot be distinguished from files in the scanner's existing schema.
-        # Finish the distinct-parent grouping before starting the join and
-        # final grouping, so their intermediate state need not coexist.
+        # First assign every entry to its parent (the root belongs to itself).
+        # Keep this grouping separate from the directory-metadata join below.
+        # Parquet streams the grouped output into private scratch storage.
         print("usage: finding directory paths", file=sys.stderr, flush=True)
+        grouped = str(Path(scratch) / "parents.parquet")
         source.execute("""
-            CREATE TEMP TABLE parents AS
-            SELECT DISTINCT regexp_replace(path, '/[^/]*$', '') AS path
-            FROM selected WHERE path <> ?
-        """, [root])
-        print("usage: grouping directory totals", file=sys.stderr, flush=True)
-        cursor = source.execute("""
-            SELECT CASE WHEN entry.path = ? OR parent.path IS NOT NULL THEN entry.path
-                        ELSE regexp_replace(entry.path, '/[^/]*$', '') END AS directory,
-                   sum(st_size), count(*)
-            FROM selected entry LEFT JOIN parents parent ON entry.path = parent.path
-            GROUP BY 1
-        """, [root])
+            COPY (
+                SELECT CASE WHEN path = $root THEN path
+                            ELSE regexp_replace(path, '/[^/]*$', '') END AS path,
+                       sum(st_size) AS size, count(*) AS entries
+                FROM selected GROUP BY 1
+            ) TO $output (FORMAT PARQUET)
+        """, {"root": root, "output": grouped})
+        source.read_parquet(grouped).create_view("parents")
+        cursor = source.execute("SELECT path, size, entries FROM parents")
         print("usage: writing directory totals", file=sys.stderr, flush=True)
         while batch := cursor.fetchmany(1000):
             for directory, size, entries in batch:
@@ -133,6 +129,22 @@ def aggregate(db, files, root, scratch):
                 ensure_directory(db, relative)
                 db.execute("UPDATE directories SET apparent_bytes=apparent_bytes+?, "
                            "entries=entries+? WHERE path=?", (int(size), entries, relative))
+        # A listed path that is also a parent is a directory. Move its own
+        # metadata from its parent into that directory before subtree rollup.
+        # Empty directories remain indistinguishable from files in this schema.
+        print("usage: assigning directory metadata", file=sys.stderr, flush=True)
+        cursor = source.execute("""
+            SELECT entry.path, entry.st_size
+            FROM selected entry JOIN parents parent ON entry.path = parent.path
+            WHERE entry.path <> ?
+        """, [root])
+        while batch := cursor.fetchmany(1000):
+            for directory, size in batch:
+                relative = PurePosixPath(directory).relative_to(root)
+                db.execute("UPDATE directories SET apparent_bytes=apparent_bytes+?, "
+                           "entries=entries+1 WHERE path=?", (int(size), relative.as_posix()))
+                db.execute("UPDATE directories SET apparent_bytes=apparent_bytes-?, "
+                           "entries=entries-1 WHERE path=?", (int(size), relative.parent.as_posix()))
     # Children always have longer paths than their parents. Read current totals
     # after children contribute and add each subtree to its parent once.
     print("usage: rolling up folder totals", file=sys.stderr, flush=True)

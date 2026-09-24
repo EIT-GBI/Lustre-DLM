@@ -42,7 +42,7 @@ def publish(source: Path, root: Path, output: Path, snapshot="2026-09-20T00:00:0
 
 
 def test_rollup_literal_paths_and_foreign_root_filter(tmp_path: Path):
-    root = tmp_path / "alice"
+    root = tmp_path / "ali'ce%_"
     root.mkdir()
     source = parquet(tmp_path, root)
     output = tmp_path / "usage.sqlite3"
@@ -122,6 +122,24 @@ def test_source_mutation_does_not_publish(tmp_path: Path):
     with patch.object(usage, "signatures", changing):
         assert publish(source, root, output) == 2
     assert not output.exists()
+
+
+def test_directory_metadata_rolls_up_across_batches(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    rows = [{"path": str(root), "st_size": 13, "code": 0}]
+    for index in range(2500):
+        directory = root / f"folder-{index}"
+        rows.extend([{"path": str(directory), "st_size": 3, "code": 0},
+                     {"path": str(directory / "file"), "st_size": 7, "code": 0}])
+    source = tmp_path / "inventory.jsonl"
+    source.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    output = tmp_path / "usage.sqlite3"
+    assert publish(source, root, output) == 0
+    with closing(sqlite3.connect(output)) as db:
+        assert db.execute("SELECT apparent_bytes, entries FROM directories WHERE path='.'").fetchone() == (25013, 5001)
+        assert db.execute("SELECT apparent_bytes, entries FROM directories WHERE path='folder-2499'").fetchone() == (10, 2)
+        assert db.execute("SELECT count(*) FROM directories").fetchone() == (2501,)
 
 
 def test_missing_ancestors_and_client_contract(tmp_path):
