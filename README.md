@@ -24,7 +24,8 @@ Use the original scan's timestamp, not the later conversion time. Parquet
 input can be one file or a dataset directory; an already partitioned user
 subset avoids reading other partitions. JSONL is supported directly when no
 conversion exists. Publication reads the input for validation and aggregation, so run a
-large publication on an allocated CPU worker. The owner-root selection is a
+large publication on an allocated CPU worker. The command reports each
+publication phase while it runs. The owner-root selection is a
 DuckDB view over that input rather than a second materialized copy. Distinct
 parent paths are grouped separately before the final join and aggregation;
 publication uses one DuckDB thread and does not preserve input row order.

@@ -95,6 +95,7 @@ def aggregate(db, files, root, scratch):
         if not {"path", "st_size", "code"}.issubset(columns):
             raise ValueError("inventory needs path, st_size and code columns")
         select_inventory(source, root)
+        print("usage: validating completed inventory", file=sys.stderr, flush=True)
         invalid = source.execute("""
             SELECT count(*) FROM selected WHERE code IS NULL OR code <> 0
                 OR st_size IS NULL OR st_size < 0
@@ -111,11 +112,13 @@ def aggregate(db, files, root, scratch):
         # cannot be distinguished from files in the scanner's existing schema.
         # Finish the distinct-parent grouping before starting the join and
         # final grouping, so their intermediate state need not coexist.
+        print("usage: finding directory paths", file=sys.stderr, flush=True)
         source.execute("""
             CREATE TEMP TABLE parents AS
             SELECT DISTINCT regexp_replace(path, '/[^/]*$', '') AS path
             FROM selected WHERE path <> ?
         """, [root])
+        print("usage: grouping directory totals", file=sys.stderr, flush=True)
         cursor = source.execute("""
             SELECT CASE WHEN entry.path = ? OR parent.path IS NOT NULL THEN entry.path
                         ELSE regexp_replace(entry.path, '/[^/]*$', '') END AS directory,
@@ -123,6 +126,7 @@ def aggregate(db, files, root, scratch):
             FROM selected entry LEFT JOIN parents parent ON entry.path = parent.path
             GROUP BY 1
         """, [root])
+        print("usage: writing directory totals", file=sys.stderr, flush=True)
         while batch := cursor.fetchmany(1000):
             for directory, size, entries in batch:
                 relative = PurePosixPath(directory).relative_to(root).as_posix()
@@ -131,6 +135,7 @@ def aggregate(db, files, root, scratch):
                            "entries=entries+? WHERE path=?", (int(size), entries, relative))
     # Children always have longer paths than their parents. Read current totals
     # after children contribute and add each subtree to its parent once.
+    print("usage: rolling up folder totals", file=sys.stderr, flush=True)
     paths = db.execute("SELECT path, parent_path FROM directories WHERE path <> '.' "
                        "ORDER BY length(path) DESC")
     for path, parent in paths:
@@ -171,6 +176,7 @@ def publish(args):
             with closing(sqlite3.connect(temporary)) as db:
                 db.executescript(SCHEMA)
                 count, total = aggregate(db, files, str(root), scratch)
+                print("usage: indexing folder report", file=sys.stderr, flush=True)
                 db.execute("CREATE INDEX directories_parent ON directories"
                            "(parent_path, apparent_bytes DESC, path)")
                 if before != signatures(source_files(source)):
