@@ -8,6 +8,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import sqlite3
 import stat
 import sys
@@ -163,6 +164,7 @@ def aggregate(db, files, root, scratch):
 
 def publish(args):
     temporary = None
+    destination_temporary = None
     try:
         if not args.completed:
             raise ValueError("use --completed only after the inventory job has finished successfully")
@@ -182,9 +184,11 @@ def publish(args):
         if destination.resolve() in files:
             raise ValueError("source and output must differ")
         before = signatures(files)
-        fd, temporary = tempfile.mkstemp(prefix=".usage-", suffix=".sqlite3", dir=destination.parent)
-        os.close(fd)
         with tempfile.TemporaryDirectory(prefix=".usage-work-") as scratch:
+            # Build the report on worker-local scratch; copy it to FSS only
+            # after SQLite has closed it, so FSS sees one sequential write.
+            fd, temporary = tempfile.mkstemp(prefix=".usage-", suffix=".sqlite3", dir=scratch)
+            os.close(fd)
             with closing(sqlite3.connect(temporary)) as db:
                 db.executescript(SCHEMA)
                 count, total = aggregate(db, files, str(root), scratch)
@@ -202,8 +206,19 @@ def publish(args):
                 }
                 db.executemany("INSERT INTO metadata VALUES (?, ?)", metadata.items())
                 db.commit()
+            fd, destination_temporary = tempfile.mkstemp(
+                prefix=".usage-", suffix=".sqlite3", dir=destination.parent
+            )
+            os.close(fd)
+            with open(temporary, "rb") as source_report, open(destination_temporary, "wb") as staged_report:
+                shutil.copyfileobj(source_report, staged_report, length=1024 * 1024)
+                staged_report.flush()
+                os.fsync(staged_report.fileno())
+            if before != signatures(source_files(source)):
+                raise ValueError("source changed during publication")
         check_output(destination)
-        os.replace(temporary, destination)
+        os.replace(destination_temporary, destination)
+        destination_temporary = None
         print(destination)
         return 0
     except Exception as error:
@@ -214,6 +229,8 @@ def publish(args):
     finally:
         if temporary is not None:
             Path(temporary).unlink(missing_ok=True)
+        if destination_temporary is not None:
+            Path(destination_temporary).unlink(missing_ok=True)
 
 
 def main():

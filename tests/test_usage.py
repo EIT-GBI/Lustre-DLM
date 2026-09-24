@@ -124,6 +124,42 @@ def test_source_mutation_does_not_publish(tmp_path: Path):
     assert not output.exists()
 
 
+def test_source_mutation_during_copy_does_not_publish(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    assert publish(source, root, output) == 0
+    previous = output.read_bytes()
+    real_signatures = usage.signatures
+    calls = 0
+
+    def changing(files):
+        nonlocal calls
+        calls += 1
+        value = real_signatures(files)
+        return value if calls < 3 else value[:-1] + [("changed-during-copy", 1, 2, 3, 4)]
+
+    with patch.object(usage, "signatures", changing):
+        assert publish(source, root, output) == 2
+    assert output.read_bytes() == previous
+    assert not list(output.parent.glob(".usage-*.sqlite3"))
+
+
+def test_copy_failure_preserves_previous_report(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    assert publish(source, root, output) == 0
+    previous = output.read_bytes()
+
+    with patch.object(usage.shutil, "copyfileobj", side_effect=OSError("copy failed")):
+        assert publish(source, root, output) == 2
+    assert output.read_bytes() == previous
+    assert not list(output.parent.glob(".usage-*.sqlite3"))
+
+
 def test_directory_metadata_rolls_up_across_batches(tmp_path: Path):
     root = tmp_path / "alice"
     root.mkdir()

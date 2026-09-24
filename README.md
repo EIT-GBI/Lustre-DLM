@@ -43,7 +43,9 @@ request to finish an active scan. Scheduling stays with the inventory owner.
 The publisher also checks source file identities, sizes and modification times
 before and after aggregation. Failed selected records, missing sizes, invalid
 paths, changing inputs and invalid timestamps leave the previous report intact.
-The new SQLite file is private (0600) and closed before it atomically replaces
+The report is built on worker-local `TMPDIR` scratch, then the closed SQLite
+file is copied sequentially into a private destination temporary (0600) before
+it atomically replaces
 the previous report; the parent directory must be owned by the caller and not
 writable by others. Source files and their permissions stay unchanged.
 
