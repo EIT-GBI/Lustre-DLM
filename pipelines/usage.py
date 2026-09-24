@@ -20,7 +20,6 @@ CREATE TABLE directories (
     path TEXT PRIMARY KEY, parent_path TEXT NOT NULL,
     apparent_bytes INTEGER NOT NULL, entries INTEGER NOT NULL
 );
-CREATE INDEX directories_parent ON directories(parent_path, apparent_bytes DESC, path);
 """
 
 
@@ -55,7 +54,9 @@ def ensure_directory(db, path):
     """Create inferred ancestors without assuming the inventory listed each one."""
     while True:
         parent = "" if path == "." else str(PurePosixPath(path).parent)
-        db.execute("INSERT OR IGNORE INTO directories VALUES (?, ?, 0, 0)", (path, parent))
+        inserted = db.execute("INSERT OR IGNORE INTO directories VALUES (?, ?, 0, 0)", (path, parent))
+        if not inserted.rowcount:
+            return  # Its ancestors were created when this directory was inserted.
         if path == ".":
             return
         path = parent
@@ -80,7 +81,8 @@ def aggregate(db, files, root, scratch):
         raise ValueError("install the optional producer dependency: duckdb") from error
     # Only directory groups cross into Python. Larger grouping operations can
     # spill into the private temporary directory instead of growing RAM.
-    with duckdb.connect(config={"threads": 2, "memory_limit": "512MB",
+    with duckdb.connect(config={"threads": 1, "memory_limit": "512MB",
+                                "preserve_insertion_order": False,
                                 "temp_directory": str(scratch)}) as source:
         names = [str(path) for path in files]
         if files[0].suffix.lower() == ".jsonl":
@@ -107,17 +109,20 @@ def aggregate(db, files, root, scratch):
         # A path with descendants is a directory. Count its own metadata there;
         # entries without descendants belong to their parent. Empty directories
         # cannot be distinguished from files in the scanner's existing schema.
+        # Finish the distinct-parent grouping before starting the join and
+        # final grouping, so their intermediate state need not coexist.
+        source.execute("""
+            CREATE TEMP TABLE parents AS
+            SELECT DISTINCT regexp_replace(path, '/[^/]*$', '') AS path
+            FROM selected WHERE path <> ?
+        """, [root])
         cursor = source.execute("""
-            WITH parents AS (
-                SELECT DISTINCT regexp_replace(path, '/[^/]*$', '') AS path
-                FROM selected WHERE path <> ?
-            )
             SELECT CASE WHEN entry.path = ? OR parent.path IS NOT NULL THEN entry.path
                         ELSE regexp_replace(entry.path, '/[^/]*$', '') END AS directory,
                    sum(st_size), count(*)
             FROM selected entry LEFT JOIN parents parent ON entry.path = parent.path
             GROUP BY 1
-        """, [root, root])
+        """, [root])
         while batch := cursor.fetchmany(1000):
             for directory, size, entries in batch:
                 relative = PurePosixPath(directory).relative_to(root).as_posix()
@@ -166,6 +171,8 @@ def publish(args):
             with closing(sqlite3.connect(temporary)) as db:
                 db.executescript(SCHEMA)
                 count, total = aggregate(db, files, str(root), scratch)
+                db.execute("CREATE INDEX directories_parent ON directories"
+                           "(parent_path, apparent_bytes DESC, path)")
                 if before != signatures(source_files(source)):
                     raise ValueError("source changed during publication")
                 metadata = {
