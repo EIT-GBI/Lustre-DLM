@@ -8,6 +8,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import sqlite3
 import stat
 import sys
@@ -20,7 +21,6 @@ CREATE TABLE directories (
     path TEXT PRIMARY KEY, parent_path TEXT NOT NULL,
     apparent_bytes INTEGER NOT NULL, entries INTEGER NOT NULL
 );
-CREATE INDEX directories_parent ON directories(parent_path, apparent_bytes DESC, path);
 """
 
 
@@ -55,10 +55,24 @@ def ensure_directory(db, path):
     """Create inferred ancestors without assuming the inventory listed each one."""
     while True:
         parent = "" if path == "." else str(PurePosixPath(path).parent)
-        db.execute("INSERT OR IGNORE INTO directories VALUES (?, ?, 0, 0)", (path, parent))
+        inserted = db.execute("INSERT OR IGNORE INTO directories VALUES (?, ?, 0, 0)", (path, parent))
+        if not inserted.rowcount:
+            return  # Its ancestors were created when this directory was inserted.
         if path == ".":
             return
         path = parent
+
+
+def select_inventory(source, root):
+    """Expose the selected source rows without materializing the full subset."""
+    import duckdb
+
+    path = duckdb.ColumnExpression("path")
+    selected = source.table("inventory").filter(
+        (path == duckdb.ConstantExpression(root))
+        | duckdb.FunctionExpression("starts_with", path, duckdb.ConstantExpression(root + "/"))
+    )
+    selected.project("path, st_size, code").create_view("selected")
 
 
 def aggregate(db, files, root, scratch):
@@ -68,7 +82,8 @@ def aggregate(db, files, root, scratch):
         raise ValueError("install the optional producer dependency: duckdb") from error
     # Only directory groups cross into Python. Larger grouping operations can
     # spill into the private temporary directory instead of growing RAM.
-    with duckdb.connect(config={"threads": 2, "memory_limit": "512MB",
+    with duckdb.connect(config={"threads": 1, "memory_limit": "512MB",
+                                "preserve_insertion_order": False,
                                 "temp_directory": str(scratch)}) as source:
         names = [str(path) for path in files]
         if files[0].suffix.lower() == ".jsonl":
@@ -80,8 +95,8 @@ def aggregate(db, files, root, scratch):
         columns = {row[0] for row in source.execute("DESCRIBE inventory").fetchall()}
         if not {"path", "st_size", "code"}.issubset(columns):
             raise ValueError("inventory needs path, st_size and code columns")
-        source.execute("CREATE TEMP TABLE selected AS SELECT path, st_size, code FROM inventory "
-                       "WHERE path = ? OR starts_with(path, ?)", [root, root + "/"])
+        select_inventory(source, root)
+        print("usage: validating completed inventory", file=sys.stderr, flush=True)
         invalid = source.execute("""
             SELECT count(*) FROM selected WHERE code IS NULL OR code <> 0
                 OR st_size IS NULL OR st_size < 0
@@ -93,28 +108,47 @@ def aggregate(db, files, root, scratch):
         count, total = source.execute("SELECT count(*), sum(st_size) FROM selected").fetchone()
         if not count:
             raise ValueError("inventory contains no entries for the selected root")
-        # A path with descendants is a directory. Count its own metadata there;
-        # entries without descendants belong to their parent. Empty directories
-        # cannot be distinguished from files in the scanner's existing schema.
-        cursor = source.execute("""
-            WITH parents AS (
-                SELECT DISTINCT regexp_replace(path, '/[^/]*$', '') AS path
-                FROM selected WHERE path <> ?
-            )
-            SELECT CASE WHEN entry.path = ? OR parent.path IS NOT NULL THEN entry.path
-                        ELSE regexp_replace(entry.path, '/[^/]*$', '') END AS directory,
-                   sum(st_size), count(*)
-            FROM selected entry LEFT JOIN parents parent ON entry.path = parent.path
-            GROUP BY 1
-        """, [root, root])
+        # First assign every entry to its parent (the root belongs to itself).
+        # Keep this grouping separate from the directory-metadata join below.
+        # Parquet streams the grouped output into private scratch storage.
+        print("usage: finding directory paths", file=sys.stderr, flush=True)
+        grouped = str(Path(scratch) / "parents.parquet")
+        source.execute("""
+            COPY (
+                SELECT CASE WHEN path = $root THEN path
+                            ELSE regexp_replace(path, '/[^/]*$', '') END AS path,
+                       sum(st_size) AS size, count(*) AS entries
+                FROM selected GROUP BY 1
+            ) TO $output (FORMAT PARQUET)
+        """, {"root": root, "output": grouped})
+        source.read_parquet(grouped).create_view("parents")
+        cursor = source.execute("SELECT path, size, entries FROM parents")
+        print("usage: writing directory totals", file=sys.stderr, flush=True)
         while batch := cursor.fetchmany(1000):
             for directory, size, entries in batch:
                 relative = PurePosixPath(directory).relative_to(root).as_posix()
                 ensure_directory(db, relative)
                 db.execute("UPDATE directories SET apparent_bytes=apparent_bytes+?, "
                            "entries=entries+? WHERE path=?", (int(size), entries, relative))
+        # A listed path that is also a parent is a directory. Move its own
+        # metadata from its parent into that directory before subtree rollup.
+        # Empty directories remain indistinguishable from files in this schema.
+        print("usage: assigning directory metadata", file=sys.stderr, flush=True)
+        cursor = source.execute("""
+            SELECT entry.path, entry.st_size
+            FROM selected entry JOIN parents parent ON entry.path = parent.path
+            WHERE entry.path <> ?
+        """, [root])
+        while batch := cursor.fetchmany(1000):
+            for directory, size in batch:
+                relative = PurePosixPath(directory).relative_to(root)
+                db.execute("UPDATE directories SET apparent_bytes=apparent_bytes+?, "
+                           "entries=entries+1 WHERE path=?", (int(size), relative.as_posix()))
+                db.execute("UPDATE directories SET apparent_bytes=apparent_bytes-?, "
+                           "entries=entries-1 WHERE path=?", (int(size), relative.parent.as_posix()))
     # Children always have longer paths than their parents. Read current totals
     # after children contribute and add each subtree to its parent once.
+    print("usage: rolling up folder totals", file=sys.stderr, flush=True)
     paths = db.execute("SELECT path, parent_path FROM directories WHERE path <> '.' "
                        "ORDER BY length(path) DESC")
     for path, parent in paths:
@@ -130,6 +164,7 @@ def aggregate(db, files, root, scratch):
 
 def publish(args):
     temporary = None
+    destination_temporary = None
     try:
         if not args.completed:
             raise ValueError("use --completed only after the inventory job has finished successfully")
@@ -149,12 +184,17 @@ def publish(args):
         if destination.resolve() in files:
             raise ValueError("source and output must differ")
         before = signatures(files)
-        fd, temporary = tempfile.mkstemp(prefix=".usage-", suffix=".sqlite3", dir=destination.parent)
-        os.close(fd)
         with tempfile.TemporaryDirectory(prefix=".usage-work-") as scratch:
+            # Build the report on worker-local scratch; copy it to FSS only
+            # after SQLite has closed it, so FSS sees one sequential write.
+            fd, temporary = tempfile.mkstemp(prefix=".usage-", suffix=".sqlite3", dir=scratch)
+            os.close(fd)
             with closing(sqlite3.connect(temporary)) as db:
                 db.executescript(SCHEMA)
                 count, total = aggregate(db, files, str(root), scratch)
+                print("usage: indexing folder report", file=sys.stderr, flush=True)
+                db.execute("CREATE INDEX directories_parent ON directories"
+                           "(parent_path, apparent_bytes DESC, path)")
                 if before != signatures(source_files(source)):
                     raise ValueError("source changed during publication")
                 metadata = {
@@ -166,8 +206,19 @@ def publish(args):
                 }
                 db.executemany("INSERT INTO metadata VALUES (?, ?)", metadata.items())
                 db.commit()
+            fd, destination_temporary = tempfile.mkstemp(
+                prefix=".usage-", suffix=".sqlite3", dir=destination.parent
+            )
+            os.close(fd)
+            with open(temporary, "rb") as source_report, open(destination_temporary, "wb") as staged_report:
+                shutil.copyfileobj(source_report, staged_report, length=1024 * 1024)
+                staged_report.flush()
+                os.fsync(staged_report.fileno())
+            if before != signatures(source_files(source)):
+                raise ValueError("source changed during publication")
         check_output(destination)
-        os.replace(temporary, destination)
+        os.replace(destination_temporary, destination)
+        destination_temporary = None
         print(destination)
         return 0
     except Exception as error:
@@ -178,6 +229,8 @@ def publish(args):
     finally:
         if temporary is not None:
             Path(temporary).unlink(missing_ok=True)
+        if destination_temporary is not None:
+            Path(destination_temporary).unlink(missing_ok=True)
 
 
 def main():

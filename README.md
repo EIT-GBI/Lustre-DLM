@@ -4,7 +4,7 @@ Data Lifecycle Management Utilities for Lustre and FSS.
 
 ## Fast folder reports for GBI
 
-`gbi data usage` reads a small indexed summary instead of walking Lustre or
+`gbi data usage` reads an indexed folder summary instead of walking Lustre or
 parsing the full inventory on every request. `pipelines/usage.py` creates that
 summary from a **completed** scanner JSONL or Parquet inventory. It does not
 start a scan, install a schedule, change quotas, or tag project IDs.
@@ -23,8 +23,18 @@ python pipelines/usage.py \
 Use the original scan's timestamp, not the later conversion time. Parquet
 input can be one file or a dataset directory; an already partitioned user
 subset avoids reading other partitions. JSONL is supported directly when no
-conversion exists. Its full input is read once during publication, so run a
-large publication on an allocated CPU worker. The default output is
+conversion exists. Publication reads the input for validation and aggregation, so run a
+large publication on an allocated CPU worker. The command reports each
+publication phase while it runs. The owner-root selection is a
+DuckDB view over that input rather than a second materialized copy. Parent
+totals are grouped into private temporary Parquet, then directory metadata is
+assigned separately. This avoids combining a large join and grouping operation.
+Publication uses one DuckDB thread and does not preserve input row order.
+DuckDB's configured limit applies to its managed execution memory, while row-group
+decoding and the operating system can still add overhead. Grouping work can
+spill to the private temporary directory. The SQLite folder index is built
+after totals are complete, avoiding index rewrites during aggregation.
+The default output is
 `~/.gbi/usage.sqlite3`; GBI normally reads the same path in the user's FSS home.
 
 A scheduled scan can call this command **after** its coordinator and collector
@@ -33,8 +43,11 @@ request to finish an active scan. Scheduling stays with the inventory owner.
 The publisher also checks source file identities, sizes and modification times
 before and after aggregation. Failed selected records, missing sizes, invalid
 paths, changing inputs and invalid timestamps leave the previous report intact.
-The new SQLite file is private (0600) and closed before it atomically replaces
-the previous report; the parent directory must be owned by the caller and not
+Set `TMPDIR` to a directory on the worker's local disk with room for the
+database and DuckDB spill files. Some clusters mount `/tmp` in RAM; check
+before using it for a large report. The report is built in that scratch
+directory, then the closed SQLite file is copied sequentially into a private
+destination temporary (0600) before it atomically replaces the previous report; the parent directory must be owned by the caller and not
 writable by others. Source files and their permissions stay unchanged.
 
 ### What the numbers mean

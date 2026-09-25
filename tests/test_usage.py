@@ -42,7 +42,7 @@ def publish(source: Path, root: Path, output: Path, snapshot="2026-09-20T00:00:0
 
 
 def test_rollup_literal_paths_and_foreign_root_filter(tmp_path: Path):
-    root = tmp_path / "alice"
+    root = tmp_path / "ali'ce%_"
     root.mkdir()
     source = parquet(tmp_path, root)
     output = tmp_path / "usage.sqlite3"
@@ -55,6 +55,25 @@ def test_rollup_literal_paths_and_foreign_root_filter(tmp_path: Path):
         assert db.execute("SELECT apparent_bytes FROM directories WHERE path='.'").fetchone() == (171,)
         assert db.execute("SELECT apparent_bytes FROM directories WHERE path='nested'").fetchone() == (50,)
         assert db.execute("SELECT apparent_bytes FROM directories WHERE path=?", ("weird%_dir",)).fetchone() == (7,)
+
+
+def test_selected_inventory_is_lazy_and_treats_root_literally(tmp_path: Path):
+    con = duckdb.connect()
+    con.execute("CREATE TABLE inventory(path VARCHAR, st_size BIGINT, code INTEGER)")
+    root = "/ali'ce%_"
+    con.executemany("INSERT INTO inventory VALUES (?, ?, ?)", [
+        (root, 100, 0), (root + "/a", 10, 0), (root + "-other/b", 999, 0),
+    ])
+    usage.select_inventory(con, root)
+    assert con.execute("SELECT path FROM selected ORDER BY path").fetchall() == [
+        (root,), (root + "/a",)
+    ]
+    assert con.execute("SELECT view_name FROM duckdb_views() WHERE view_name='selected'").fetchone() == ("selected",)
+    con.execute("INSERT INTO inventory VALUES (?, ?, ?)", (root + "/new", 4, 0))
+    assert con.execute("SELECT path FROM selected ORDER BY path").fetchall() == [
+        (root,), (root + "/a",), (root + "/new",)
+    ]
+    con.close()
 
 
 def test_errors_preserve_previous_complete(tmp_path: Path):
@@ -103,6 +122,60 @@ def test_source_mutation_does_not_publish(tmp_path: Path):
     with patch.object(usage, "signatures", changing):
         assert publish(source, root, output) == 2
     assert not output.exists()
+
+
+def test_source_mutation_during_copy_does_not_publish(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    assert publish(source, root, output) == 0
+    previous = output.read_bytes()
+    real_signatures = usage.signatures
+    calls = 0
+
+    def changing(files):
+        nonlocal calls
+        calls += 1
+        value = real_signatures(files)
+        return value if calls < 3 else value[:-1] + [("changed-during-copy", 1, 2, 3, 4)]
+
+    with patch.object(usage, "signatures", changing):
+        assert publish(source, root, output) == 2
+    assert output.read_bytes() == previous
+    assert not list(output.parent.glob(".usage-*.sqlite3"))
+
+
+def test_copy_failure_preserves_previous_report(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    assert publish(source, root, output) == 0
+    previous = output.read_bytes()
+
+    with patch.object(usage.shutil, "copyfileobj", side_effect=OSError("copy failed")):
+        assert publish(source, root, output) == 2
+    assert output.read_bytes() == previous
+    assert not list(output.parent.glob(".usage-*.sqlite3"))
+
+
+def test_directory_metadata_rolls_up_across_batches(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    rows = [{"path": str(root), "st_size": 13, "code": 0}]
+    for index in range(2500):
+        directory = root / f"folder-{index}"
+        rows.extend([{"path": str(directory), "st_size": 3, "code": 0},
+                     {"path": str(directory / "file"), "st_size": 7, "code": 0}])
+    source = tmp_path / "inventory.jsonl"
+    source.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    output = tmp_path / "usage.sqlite3"
+    assert publish(source, root, output) == 0
+    with closing(sqlite3.connect(output)) as db:
+        assert db.execute("SELECT apparent_bytes, entries FROM directories WHERE path='.'").fetchone() == (25013, 5001)
+        assert db.execute("SELECT apparent_bytes, entries FROM directories WHERE path='folder-2499'").fetchone() == (10, 2)
+        assert db.execute("SELECT count(*) FROM directories").fetchone() == (2501,)
 
 
 def test_missing_ancestors_and_client_contract(tmp_path):
