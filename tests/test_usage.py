@@ -37,7 +37,7 @@ def parquet(tmp_path: Path, root: Path, rows: int = 4) -> Path:
 def publish(source: Path, root: Path, output: Path, snapshot="2026-09-20T00:00:00Z"):
     args = type("Args", (), {"completed": True, "snapshot_at": snapshot,
                               "root": str(root), "input": str(source),
-                              "output": str(output)})
+                              "output": str(output), "fss_usage": None})
     return usage.publish(args)
 
 
@@ -55,6 +55,57 @@ def test_rollup_literal_paths_and_foreign_root_filter(tmp_path: Path):
         assert db.execute("SELECT apparent_bytes FROM directories WHERE path='.'").fetchone() == (171,)
         assert db.execute("SELECT apparent_bytes FROM directories WHERE path='nested'").fetchone() == (50,)
         assert db.execute("SELECT apparent_bytes FROM directories WHERE path=?", ("weird%_dir",)).fetchone() == (7,)
+
+
+def test_owner_scoped_fss_measurement_is_published(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    fss = tmp_path / "fss.json"
+    fss.write_text(json.dumps({
+        "owner_uid": os.getuid(), "used_bytes": 123, "files": 4,
+        "limit_bytes": 1000, "observed_at": "2026-09-20T00:00:00Z",
+        "source": "OCI FSS per-UID usage",
+    }))
+    args = type("Args", (), {
+        "completed": True, "snapshot_at": "2026-09-20T00:00:00Z",
+        "root": str(root), "input": str(source), "output": str(output),
+        "fss_usage": str(fss),
+    })
+    assert usage.publish(args) == 0
+    with closing(sqlite3.connect(output)) as db:
+        metadata = dict(db.execute("SELECT key, value FROM metadata"))
+    assert metadata["fss_used_bytes"] == "123"
+    assert metadata["fss_files"] == "4"
+    assert metadata["fss_limit_bytes"] == "1000"
+    assert metadata["fss_source"] == "OCI FSS per-UID usage"
+
+
+def test_foreign_or_invalid_fss_measurement_preserves_previous_report(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    assert publish(source, root, output) == 0
+    previous = output.read_bytes()
+    fss = tmp_path / "fss.json"
+    for payload in [
+        {"owner_uid": os.getuid() + 1, "used_bytes": 1, "files": 1,
+         "observed_at": "2026-09-20T00:00:00Z"},
+        {"owner_uid": os.getuid(), "used_bytes": -1, "files": 1,
+         "observed_at": "2026-09-20T00:00:00Z"},
+        {"owner_uid": os.getuid(), "used_bytes": 1, "files": 1,
+         "observed_at": "2999-01-01T00:00:00Z"},
+    ]:
+        fss.write_text(json.dumps(payload))
+        args = type("Args", (), {
+            "completed": True, "snapshot_at": "2026-09-20T00:00:00Z",
+            "root": str(root), "input": str(source), "output": str(output),
+            "fss_usage": str(fss),
+        })
+        assert usage.publish(args) == 2
+        assert output.read_bytes() == previous
 
 
 def test_selected_inventory_is_lazy_and_treats_root_literally(tmp_path: Path):
