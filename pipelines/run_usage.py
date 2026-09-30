@@ -25,7 +25,8 @@ def private_directory(path: Path) -> None:
 
 def report_counts(report: Path) -> dict[str, str]:
     """Read the published report's own totals for the completion manifest."""
-    keys = ("entries", "apparent_bytes", "snapshot_at", "fss_observed_at")
+    keys = ("status", "entries", "apparent_bytes", "unreadable_directories", "snapshot_at",
+            "fss_observed_at")
     with sqlite3.connect(f"{report.as_uri()}?mode=ro", uri=True) as db:
         rows = dict(db.execute(
             f"SELECT key, value FROM metadata WHERE key IN ({','.join('?' * len(keys))})", keys
