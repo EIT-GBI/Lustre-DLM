@@ -83,3 +83,43 @@ class ScanEndToEnd(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(HAVE_RUNTIME and os.getuid() != 0, "needs the project environment, not root")
+class UnreadableDirectory(ScanEndToEnd):
+    """An owner scan meets a folder it may not open: publish, but as partial."""
+
+    def setUp(self):
+        super().setUp()
+        self.locked = self.root / "service-owned"
+        self.locked.mkdir()
+        (self.locked / "hidden.bin").write_bytes(b"z" * 10)
+        self.locked.chmod(0)
+
+    def tearDown(self):
+        self.locked.chmod(0o700)
+        super().tearDown()
+
+    def test_launcher_scans_every_entry(self):
+        output = self.base / "scan.jsonl"
+        subprocess.run([str(PROJECT / "stat_srun"), f"--prefix={self.root}",
+                        f"--outfile={output}", "--threads=2"],
+                       env=self.env, check=True, timeout=120, capture_output=True)
+        records = {json.loads(line)["path"]: json.loads(line) for line in output.read_text().splitlines()}
+        self.assertEqual(records[str(self.locked)]["code"], 13)
+        self.assertNotIn(str(self.locked / "hidden.bin"), records)
+
+    def test_entrypoint_publishes_report_and_manifest(self):
+        inventory = self.base / "inventory"
+        report = self.base / "home" / ".gbi" / "usage.sqlite3"
+        report.parent.mkdir(parents=True)
+        subprocess.run([sys.executable, str(PROJECT / "pipelines" / "run_usage.py"),
+                        "--root", str(self.root), "--inventory-dir", str(inventory),
+                        "--output", str(report), "--threads", "2"],
+                       env=self.env, check=True, timeout=180, capture_output=True)
+        manifest = json.loads((inventory / "latest.json").read_text())
+        self.assertEqual((manifest["report_status"], manifest["report_unreadable_directories"]),
+                         ("partial", "1"))
+        with sqlite3.connect(report) as db:
+            metadata = dict(db.execute("SELECT key, value FROM metadata"))
+        self.assertEqual((metadata["status"], metadata["complete_input"]), ("partial", "false"))

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from contextlib import closing
 from datetime import datetime, timezone
+import errno
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -123,8 +124,12 @@ def aggregate(db, files, root, scratch):
             raise ValueError("inventory needs path, st_size and code columns")
         select_inventory(source, root)
         print("usage: validating completed inventory", file=sys.stderr, flush=True)
-        invalid = source.execute("""
-            SELECT count(*) FROM selected WHERE code IS NULL OR code <> 0
+        # EACCES: a directory the owner could not open; kept as an entry, but
+        # its contents are unknown, so the publication becomes partial.
+        unreadable = source.execute(
+            f"SELECT count(*) FROM selected WHERE code = {errno.EACCES}").fetchone()[0]
+        invalid = source.execute(f"""
+            SELECT count(*) FROM selected WHERE code IS NULL OR code NOT IN (0, {errno.EACCES})
                 OR st_size IS NULL OR st_size < 0
                 OR contains(path, '//') OR contains(path, '/./') OR contains(path, '/../')
                 OR ends_with(path, '/.') OR ends_with(path, '/..') OR ends_with(path, '/')
@@ -185,7 +190,7 @@ def aggregate(db, files, root, scratch):
     observed = db.execute("SELECT apparent_bytes, entries FROM directories WHERE path='.'").fetchone()
     if observed != (int(total), count):
         raise ValueError("directory totals do not reconcile with the source")
-    return count, int(total)
+    return count, int(total), unreadable
 
 
 def publish(args):
@@ -218,7 +223,7 @@ def publish(args):
             os.close(fd)
             with closing(sqlite3.connect(temporary)) as db:
                 db.executescript(SCHEMA)
-                count, total = aggregate(db, files, str(root), scratch)
+                count, total, unreadable = aggregate(db, files, str(root), scratch)
                 print("usage: indexing folder report", file=sys.stderr, flush=True)
                 db.execute("CREATE INDEX directories_parent ON directories"
                            "(parent_path, apparent_bytes DESC, path)")
@@ -226,7 +231,9 @@ def publish(args):
                     raise ValueError("source changed during publication")
                 metadata = {
                     "schema_version": "1", "owner_uid": str(os.getuid()), "root": str(root),
-                    "status": "complete", "complete_input": "true",
+                    "status": "partial" if unreadable else "complete",
+                    "complete_input": "false" if unreadable else "true",
+                    "unreadable_directories": str(unreadable),
                     "snapshot_at": stamp.isoformat(),
                     "published_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     "source": str(source), "entries": str(count), "apparent_bytes": str(total),

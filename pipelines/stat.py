@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 import argparse
@@ -67,6 +68,12 @@ def scan(spec: Spec, result: Emit, discover: Discover) -> None:
     path = spec.get("path", ".")
     try:
         it = os.scandir(path)
+    except PermissionError as err:
+        # An owner-run scan meets directories it may not open (for example a
+        # service-owned folder inside a home). Record the directory itself with
+        # the errno so the publisher can report the snapshot as partial.
+        result(object_record(os.path.basename(path), path, errno.EACCES, os.lstat(path)))
+        return
     except OSError as err:
         raise Permanent(f"cannot list '{path}': {err}") from err
 

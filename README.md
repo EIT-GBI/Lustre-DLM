@@ -104,7 +104,7 @@ provides `lustre-dlm-usage`, which sets `LUSTRE_DLM_PYTHON` and
 `LUSTRE_DLM_REVISION` before running this entrypoint:
 
 ```sh
-/mnt/gbi-shared/software/lustre-dlm/0.2.1/bin/lustre-dlm-usage \
+/mnt/gbi-shared/software/lustre-dlm/0.2.2/bin/lustre-dlm-usage \
   --root /mnt/lustre/users/OWNER \
   --inventory-dir /mnt/lustre/users/OWNER/.gbi/inventory \
   --output /mnt/gbi-shared/home/OWNER/.gbi/usage.sqlite3 \
@@ -129,6 +129,12 @@ When the site collector has produced an owner-scoped OCI measurement, pass
 `source`. The publisher rejects foreign UIDs, negative counters, future or
 timezone-free observations, and control characters before replacing a report.
 OCI FSS reports logical data bytes and excludes snapshots.
+
+An owner may not be able to open every directory under their root (for
+example a service-owned folder). The scanner records such a directory as one
+entry with code 13 (EACCES) instead of failing; the publisher keeps it, sets
+`unreadable_directories`, and publishes the report as `partial`, which
+`gbi data usage` shows. Any other scan or stat failure still fails the run.
 
 The inventory directory is caller-owned mode 0700. A non-blocking lock
 rejects overlapping collections. Scanner or publisher failure removes only the
