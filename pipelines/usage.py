@@ -103,6 +103,24 @@ def select_inventory(source, root):
     selected.project("path, st_size, code").create_view("selected")
 
 
+def duckdb_memory_limit():
+    """DuckDB's managed-memory cap for this publication.
+
+    512 MB was enough for a Parquet input, but grouping tens of millions of
+    paths read from JSONL needs more (weekly run, 30 Sep: out of memory at
+    488 MiB). Inside Slurm use 40% of the job's memory, leaving the rest for
+    DuckDB's unmanaged allocations; LUSTRE_DLM_DUCKDB_MEMORY overrides.
+    """
+    configured = os.environ.get("LUSTRE_DLM_DUCKDB_MEMORY", "").strip()
+    if configured:
+        return configured
+    try:
+        job_mib = int(os.environ.get("SLURM_MEM_PER_NODE", ""))
+    except ValueError:
+        return "512MB"
+    return f"{max(512, job_mib * 2 // 5)}MB"
+
+
 def aggregate(db, files, root, scratch):
     try:
         import duckdb
@@ -110,7 +128,7 @@ def aggregate(db, files, root, scratch):
         raise ValueError("install the optional producer dependency: duckdb") from error
     # Only directory groups cross into Python. Larger grouping operations can
     # spill into the private temporary directory instead of growing RAM.
-    with duckdb.connect(config={"threads": 1, "memory_limit": "512MB",
+    with duckdb.connect(config={"threads": 1, "memory_limit": duckdb_memory_limit(),
                                 "preserve_insertion_order": False,
                                 "temp_directory": str(scratch)}) as source:
         names = [str(path) for path in files]
