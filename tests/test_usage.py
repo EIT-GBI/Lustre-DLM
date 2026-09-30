@@ -82,6 +82,28 @@ def test_owner_scoped_fss_measurement_is_published(tmp_path: Path):
     assert metadata["fss_source"] == "OCI FSS per-UID usage"
 
 
+def test_fss_measurement_without_file_count_is_published(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    fss = tmp_path / "fss.json"
+    fss.write_text(json.dumps({
+        "owner_uid": os.getuid(), "used_bytes": 123,
+        "observed_at": "2026-09-20T00:00:00Z", "source": "OCI FSS quota accounting",
+    }))
+    args = type("Args", (), {
+        "completed": True, "snapshot_at": "2026-09-20T00:00:00Z",
+        "root": str(root), "input": str(source), "output": str(output),
+        "fss_usage": str(fss),
+    })
+    assert usage.publish(args) == 0
+    with closing(sqlite3.connect(output)) as db:
+        metadata = dict(db.execute("SELECT key, value FROM metadata"))
+    assert metadata["fss_used_bytes"] == "123"
+    assert "fss_files" not in metadata and "fss_limit_bytes" not in metadata
+
+
 def test_foreign_or_invalid_fss_measurement_preserves_previous_report(tmp_path: Path):
     root = tmp_path / "alice"
     root.mkdir()

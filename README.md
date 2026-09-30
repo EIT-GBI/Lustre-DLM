@@ -104,7 +104,7 @@ provides `lustre-dlm-usage`, which sets `LUSTRE_DLM_PYTHON` and
 `LUSTRE_DLM_REVISION` before running this entrypoint:
 
 ```sh
-/mnt/gbi-shared/software/lustre-dlm/0.2.2/bin/lustre-dlm-usage \
+/mnt/gbi-shared/software/lustre-dlm/0.2.3/bin/lustre-dlm-usage \
   --root /mnt/lustre/users/OWNER \
   --inventory-dir /mnt/lustre/users/OWNER/.gbi/inventory \
   --output /mnt/gbi-shared/home/OWNER/.gbi/usage.sqlite3 \
@@ -125,8 +125,8 @@ Temporary DuckDB and uv state use the job's worker-local `$TMPDIR`.
 
 When the site collector has produced an owner-scoped OCI measurement, pass
 `--fss-usage /path/to/owner.json`. The JSON contract is `owner_uid`,
-`used_bytes`, `files`, `observed_at`, optional `limit_bytes`, and optional
-`source`. The publisher rejects foreign UIDs, negative counters, future or
+`used_bytes`, `observed_at`, optional `files` (OCI quota accounting has no file
+count), optional `limit_bytes`, and optional `source`. The publisher rejects foreign UIDs, negative counters, future or
 timezone-free observations, and control characters before replacing a report.
 OCI FSS reports logical data bytes and excludes snapshots.
 
