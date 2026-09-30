@@ -161,6 +161,17 @@ else
 fi
 
 # ---- slurm run ----
+# Several owners' collections can share one node, so each job takes three
+# free ports on the head node (where this batch script runs) instead of fixed
+# ones: a second job must never bind-fail and then talk to another job's pipes.
+read -r work_port completions_port results_port < <(python3 -c '
+import socket
+sockets = [socket.socket() for _ in range(3)]
+for s in sockets:
+    s.bind(("", 0))
+print(*(s.getsockname()[1] for s in sockets))
+')
+[[ -n "$results_port" ]] || { echo "Error: could not reserve pipe ports" >&2; exit 2; }
 head_node=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -1)
 allocated_nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | wc -l)
 
@@ -179,20 +190,20 @@ fi
 "${head_step[@]}"                                                         \
     "${python_runner[@]}" ${__TARGET__} bus                               \
     --wait 60                                                             \
-    --work 0.0.0.0:9101 --completions 0.0.0.0:9102 --results 0.0.0.0:9103 &
+    --work "0.0.0.0:$work_port" --completions "0.0.0.0:$completions_port" --results "0.0.0.0:$results_port" &
 bus_pid=$!
 
 "${worker_step[@]}"                                            \
     "${python_runner[@]}" ${__TARGET__} worker                 \
         --threads $threads --wait 60                           \
-        --work $head_node:9101                                 \
-        --completions $head_node:9102                          \
-    --results $head_node:9103                              &
+        --work "$head_node:$work_port"                                \
+        --completions "$head_node:$completions_port"                         \
+    --results "$head_node:$results_port"                             &
 worker_pid=$!
 
 "${head_step[@]}"                                                         \
     "${python_runner[@]}" ${__TARGET__} collect                           \
-    -o "$outfile" --wait 60 --results 0.0.0.0:9103                       &
+    -o "$outfile" --wait 60 --results "0.0.0.0:$results_port"      &
 collector_pid=$!
 
 is_active() {
@@ -235,7 +246,7 @@ worker_status=0
 "${head_step[@]}"                                              \
     "${python_runner[@]}" ${__TARGET__} coordinator                       \
     "$prefix" --wait 60                                                   \
-    --work 0.0.0.0:9101 --completions 0.0.0.0:9102 --results 0.0.0.0:9103 &
+    --work "0.0.0.0:$work_port" --completions "0.0.0.0:$completions_port" --results "0.0.0.0:$results_port" &
 coordinator_pid=$!
 
 reap_role() {

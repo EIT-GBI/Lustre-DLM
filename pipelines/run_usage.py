@@ -9,6 +9,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -74,6 +75,12 @@ def run(args) -> Path:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise RuntimeError("another usage collection is already active") from error
+        # Holding the lock, no other collection can be writing here: an
+        # unfinished inventory is left over from a killed run (each can be
+        # many GB), never live data.
+        for stale in inventory_dir.glob(".lustre-*.jsonl"):
+            if stale.is_file() and not stale.is_symlink():
+                stale.unlink()
         fd, pending_name = tempfile.mkstemp(
             prefix=f".{basename}-", suffix=".jsonl", dir=inventory_dir
         )
@@ -116,7 +123,14 @@ def run(args) -> Path:
             pending.unlink(missing_ok=True)
 
 
+def _terminate(signum, _frame):
+    # scancel sends SIGTERM: unwind through the finally blocks so the
+    # unfinished inventory is removed and the previous outputs are kept.
+    raise SystemExit(128 + signum)
+
+
 def main() -> int:
+    signal.signal(signal.SIGTERM, _terminate)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", required=True, help="owner's canonical Lustre root")
     parser.add_argument("--inventory-dir", required=True, help="private completed inventories and manifest")
