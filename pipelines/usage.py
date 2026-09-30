@@ -65,7 +65,8 @@ def fss_metadata(path):
     values = {}
     for source, target in (("used_bytes", "fss_used_bytes"), ("files", "fss_files"),
                            ("limit_bytes", "fss_limit_bytes")):
-        if source not in payload and source == "limit_bytes":
+        # OCI FSS quota accounting reports bytes only; file counts are optional.
+        if source not in payload and source in {"files", "limit_bytes"}:
             continue
         value = int(payload[source])
         if value < 0:
