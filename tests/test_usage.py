@@ -334,3 +334,15 @@ for name, function in list(globals().items()):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_duckdb_memory_follows_the_slurm_allocation(monkeypatch):
+    monkeypatch.delenv("LUSTRE_DLM_DUCKDB_MEMORY", raising=False)
+    monkeypatch.delenv("SLURM_MEM_PER_NODE", raising=False)
+    assert usage.duckdb_memory_limit() == "512MB"
+    monkeypatch.setenv("SLURM_MEM_PER_NODE", "32768")
+    assert usage.duckdb_memory_limit() == "13107MB"
+    monkeypatch.setenv("SLURM_MEM_PER_NODE", "1024")
+    assert usage.duckdb_memory_limit() == "512MB"
+    monkeypatch.setenv("LUSTRE_DLM_DUCKDB_MEMORY", "2GB")
+    assert usage.duckdb_memory_limit() == "2GB"

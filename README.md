@@ -104,7 +104,7 @@ provides `lustre-dlm-usage`, which sets `LUSTRE_DLM_PYTHON` and
 `LUSTRE_DLM_REVISION` before running this entrypoint:
 
 ```sh
-/mnt/gbi-shared/software/lustre-dlm/0.2.4/bin/lustre-dlm-usage \
+/mnt/gbi-shared/software/lustre-dlm/0.2.5/bin/lustre-dlm-usage \
   --root /mnt/lustre/users/OWNER \
   --inventory-dir /mnt/lustre/users/OWNER/.gbi/inventory \
   --output /mnt/gbi-shared/home/OWNER/.gbi/usage.sqlite3 \
@@ -121,7 +121,9 @@ allocation `stat_srun` runs the bus, collector, coordinator and workers as
 overlapping steps on that node; with more nodes, workers keep off the head
 node as before. The largest current owner (about 83 million entries) needed
 16 GiB and 1.5 hours to publish; request 48 GiB and at least 12 hours.
-Temporary DuckDB and uv state use the job's worker-local `$TMPDIR`.
+Temporary DuckDB and uv state use the job's worker-local `$TMPDIR`. DuckDB's managed
+memory is 40% of the job's `SLURM_MEM_PER_NODE` (512 MB outside Slurm);
+`LUSTRE_DLM_DUCKDB_MEMORY` overrides it.
 
 When the site collector has produced an owner-scoped OCI measurement, pass
 `--fss-usage /path/to/owner.json`. The JSON contract is `owner_uid`,
