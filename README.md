@@ -80,6 +80,15 @@ PYTHONPATH=/path/to/GBI-Compute-Software-Modules/gbi/src/lib \
   python -m unittest discover -s tests -v
 ```
 
+`tests/test_scan_end_to_end.py` runs the real `stat_srun`, qpipe roles and
+publisher on a small local tree through a pass-through `srun`. It needs the
+project environment itself (not `uv run --with`, which hides `orchestrator`):
+
+```sh
+uv sync --frozen --extra usage
+.venv/bin/python -m unittest tests.test_scan_end_to_end -v
+```
+
 ## Schedule-ready collection
 
 `pipelines/run_usage.py` is the production boundary for one owner. Run it as
@@ -95,7 +104,7 @@ provides `lustre-dlm-usage`, which sets `LUSTRE_DLM_PYTHON` and
 `LUSTRE_DLM_REVISION` before running this entrypoint:
 
 ```sh
-/mnt/gbi-shared/software/lustre-dlm/0.2.0/bin/lustre-dlm-usage \
+/mnt/gbi-shared/software/lustre-dlm/0.2.1/bin/lustre-dlm-usage \
   --root /mnt/lustre/users/OWNER \
   --inventory-dir /mnt/lustre/users/OWNER/.gbi/inventory \
   --output /mnt/gbi-shared/home/OWNER/.gbi/usage.sqlite3 \
