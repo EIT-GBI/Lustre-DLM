@@ -157,15 +157,28 @@ else
 fi
 
 # ---- slurm run ----
-head_node=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -1)   
+head_node=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -1)
+allocated_nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | wc -l)
 
-srun --exact -N 1 -n 1 -w $head_node                                      \
+# A multi-node allocation keeps the head node for the bus, collector and
+# coordinator and runs workers everywhere else. A single-node allocation (one
+# owner's scheduled collection) has no "everywhere else": all roles then share
+# that node as overlapping steps, so a step never waits for another's memory.
+if [ "$allocated_nodes" -gt 1 ]; then
+    head_step=(srun --exact -N 1 -n 1 -w "$head_node")
+    worker_step=(srun --exact -N "$nodes" -n "$process" --exclude "$head_node")
+else
+    head_step=(srun --overlap -N 1 -n 1 -w "$head_node")
+    worker_step=(srun --overlap -N 1 -n "$process" -w "$head_node")
+fi
+
+"${head_step[@]}"                                                         \
     "${python_runner[@]}" ${__TARGET__} bus                               \
     --wait 60                                                             \
     --work 0.0.0.0:9101 --completions 0.0.0.0:9102 --results 0.0.0.0:9103 &
 bus_pid=$!
 
-srun --exact -N $nodes -n $process --exclude $head_node        \
+"${worker_step[@]}"                                            \
     "${python_runner[@]}" ${__TARGET__} worker                 \
         --threads $threads --wait 60                           \
         --work $head_node:9101                                 \
@@ -173,7 +186,7 @@ srun --exact -N $nodes -n $process --exclude $head_node        \
     --results $head_node:9103                              &
 worker_pid=$!
 
-srun --exact -N 1 -n 1 -w $head_node                                      \
+"${head_step[@]}"                                                         \
     "${python_runner[@]}" ${__TARGET__} collect                           \
     -o $outfile --wait 60                                                 \
     --work 0.0.0.0:9101 --completions 0.0.0.0:9102 --results 0.0.0.0:9103 &
@@ -216,7 +229,7 @@ collector_status=0
 bus_status=0
 worker_status=0
 
-srun --exact -N 1 -n 1 -w "$head_node"                         \
+"${head_step[@]}"                                              \
     "${python_runner[@]}" ${__TARGET__} coordinator                       \
     "$prefix" --wait 60                                                   \
     --work 0.0.0.0:9101 --completions 0.0.0.0:9102 --results 0.0.0.0:9103 &

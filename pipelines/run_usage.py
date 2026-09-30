@@ -9,7 +9,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
-import stat
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -21,6 +21,23 @@ def private_directory(path: Path) -> None:
     info = path.stat()
     if info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise ValueError("inventory directory must be caller-owned and private")
+
+
+def report_counts(report: Path) -> dict[str, str]:
+    """Read the published report's own totals for the completion manifest."""
+    keys = ("entries", "apparent_bytes", "snapshot_at", "fss_observed_at")
+    with sqlite3.connect(f"{report.as_uri()}?mode=ro", uri=True) as db:
+        rows = dict(db.execute(
+            f"SELECT key, value FROM metadata WHERE key IN ({','.join('?' * len(keys))})", keys
+        ))
+    return {key: rows[key] for key in keys if key in rows}
+
+
+def prune_inventories(inventory_dir: Path, keep: Path) -> None:
+    """Keep only the inventory behind the current report; each can be many GB."""
+    for path in inventory_dir.glob("lustre-*.jsonl"):
+        if path != keep and path.is_file() and not path.is_symlink():
+            path.unlink()
 
 
 def revision(root: Path) -> str:
@@ -80,6 +97,8 @@ def run(args) -> Path:
                 "published_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "root": str(owner_root), "inventory": str(completed),
                 "report": str(output), "revision": revision(project),
+                "report_bytes": output.stat().st_size,
+                **{f"report_{key}": value for key, value in report_counts(output).items()},
             }
             fd, temporary_name = tempfile.mkstemp(
                 prefix=".latest-", suffix=".json", dir=inventory_dir
@@ -90,6 +109,7 @@ def run(args) -> Path:
                 temporary.flush()
                 os.fsync(temporary.fileno())
             os.replace(temporary_name, manifest)
+            prune_inventories(inventory_dir, completed)
             return manifest
         finally:
             pending.unlink(missing_ok=True)
