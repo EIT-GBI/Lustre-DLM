@@ -80,6 +80,19 @@ class RunUsage(unittest.TestCase):
         self.assertEqual(self.output.read_bytes(), b"old sqlite")
         self.assertFalse(list(self.inventory.glob(".*.jsonl")))
 
+    @patch("pipelines.run_usage.subprocess.run",
+           side_effect=subprocess.CalledProcessError(1, ["scan"]))
+    def test_unfinished_inventory_of_a_killed_run_is_removed_under_the_lock(self, _run):
+        self.inventory.mkdir(mode=0o700)
+        stale = self.inventory / ".lustre-20260930T184557Z-bdb332e3-m895l4mr.jsonl"
+        stale.write_text("partial\n")
+        kept = self.inventory / "lustre-20260923T000000Z-00000000.jsonl"
+        kept.write_text("complete\n")
+        with self.assertRaises(subprocess.CalledProcessError):
+            run_usage.run(self.args)
+        self.assertFalse(stale.exists())
+        self.assertTrue(kept.exists())
+
     def test_rejects_non_private_inventory_directory(self):
         self.inventory.mkdir(mode=0o755)
         with self.assertRaisesRegex(ValueError, "caller-owned and private"):

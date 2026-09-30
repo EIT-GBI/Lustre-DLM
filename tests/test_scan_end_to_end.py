@@ -63,6 +63,18 @@ class ScanEndToEnd(unittest.TestCase):
         self.assertTrue({str(self.root / "notes.txt"), str(self.root / "results" / "a.bin"),
                          str(self.root / "results" / "nested" / "b.bin")} <= paths)
 
+    def test_two_collections_on_one_node_use_separate_pipes(self):
+        outputs = [self.base / "a.jsonl", self.base / "b.jsonl"]
+        runs = [subprocess.Popen([str(PROJECT / "stat_srun"), f"--prefix={self.root}",
+                                  f"--outfile={output}", "--threads=2"],
+                                 env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                for output in outputs]
+        for run in runs:
+            _, stderr = run.communicate(timeout=120)
+            self.assertEqual(run.returncode, 0, stderr[-2000:])
+        counts = [len(output.read_text().splitlines()) for output in outputs]
+        self.assertEqual(counts[0], counts[1])
+
     def test_entrypoint_publishes_report_and_manifest(self):
         inventory = self.base / "inventory"
         report = self.base / "home" / ".gbi" / "usage.sqlite3"
