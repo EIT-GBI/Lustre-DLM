@@ -143,17 +143,30 @@ done
 __resolve_prefix
 __resolve_target ${__PREFIX__}/pipelines/stat.py
 
+# Production images provide one prebuilt, revision-pinned environment. Local
+# development keeps the existing uv path. Refuse a relative or missing override
+# so a scheduled job cannot silently select another interpreter from PATH.
+if [[ -n "${LUSTRE_DLM_PYTHON:-}" ]]; then
+    [[ "$LUSTRE_DLM_PYTHON" == /* && -x "$LUSTRE_DLM_PYTHON" ]] || {
+        echo "Error: LUSTRE_DLM_PYTHON must be an absolute executable" >&2
+        exit 2
+    }
+    python_runner=("$LUSTRE_DLM_PYTHON")
+else
+    python_runner=(uv run --project="$__PREFIX__" python)
+fi
+
 # ---- slurm run ----
 head_node=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -1)   
 
 srun --exact -N 1 -n 1 -w $head_node                                      \
-    uv run --project=${__PREFIX__} python ${__TARGET__} bus               \
+    "${python_runner[@]}" ${__TARGET__} bus                               \
     --wait 60                                                             \
     --work 0.0.0.0:9101 --completions 0.0.0.0:9102 --results 0.0.0.0:9103 &
 bus_pid=$!
 
 srun --exact -N $nodes -n $process --exclude $head_node        \
-    uv run --project=${__PREFIX__} python ${__TARGET__} worker \
+    "${python_runner[@]}" ${__TARGET__} worker                 \
         --threads $threads --wait 60                           \
         --work $head_node:9101                                 \
         --completions $head_node:9102                          \
@@ -161,7 +174,7 @@ srun --exact -N $nodes -n $process --exclude $head_node        \
 worker_pid=$!
 
 srun --exact -N 1 -n 1 -w $head_node                                      \
-    uv run --project=${__PREFIX__} python ${__TARGET__} collect           \
+    "${python_runner[@]}" ${__TARGET__} collect                           \
     -o $outfile --wait 60                                                 \
     --work 0.0.0.0:9101 --completions 0.0.0.0:9102 --results 0.0.0.0:9103 &
 collector_pid=$!
@@ -204,7 +217,7 @@ bus_status=0
 worker_status=0
 
 srun --exact -N 1 -n 1 -w "$head_node"                         \
-    uv run --project=${__PREFIX__} python ${__TARGET__} coordinator       \
+    "${python_runner[@]}" ${__TARGET__} coordinator                       \
     "$prefix" --wait 60                                                   \
     --work 0.0.0.0:9101 --completions 0.0.0.0:9102 --results 0.0.0.0:9103 &
 coordinator_pid=$!

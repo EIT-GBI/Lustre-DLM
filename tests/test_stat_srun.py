@@ -48,7 +48,7 @@ def fake_slurm(tmp_path: Path) -> tuple[Path, Path]:
     return bin_dir, bin_dir / "srun"
 
 
-def invoke(tmp_path: Path, *, coordinator_status: int = 0, collector_status: int = 0, worker_status: int = 0) -> tuple[subprocess.CompletedProcess, Path]:
+def invoke(tmp_path: Path, *, coordinator_status: int = 0, collector_status: int = 0, worker_status: int = 0, python: str | None = None) -> tuple[subprocess.CompletedProcess, Path]:
     bin_dir, _ = fake_slurm(tmp_path)
     log = tmp_path / "events.log"
     marker = tmp_path / "collector.done"
@@ -63,11 +63,19 @@ def invoke(tmp_path: Path, *, coordinator_status: int = 0, collector_status: int
         "WORKER_STATUS": str(worker_status),
         "COLLECT_DELAY": "0.5",
     })
+    if python is not None:
+        env["LUSTRE_DLM_PYTHON"] = python
     result = subprocess.run(
         [str(LAUNCHER), f"--prefix={tmp_path}", "--outfile=/dev/null"],
         env=env, text=True, capture_output=True, timeout=5,
     )
     return result, log
+
+
+def test_rejects_missing_production_interpreter(tmp_path: Path):
+    result, _ = invoke(tmp_path, python=str(tmp_path / "missing-python"))
+    assert result.returncode == 2
+    assert "absolute executable" in result.stderr
 
 
 def test_waits_for_collector_and_cleans_owned_services(tmp_path: Path):

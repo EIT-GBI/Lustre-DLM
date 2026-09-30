@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from contextlib import closing
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
@@ -49,6 +50,31 @@ def check_output(destination):
         return
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
         raise ValueError("existing output must be a regular file owned by the caller")
+
+
+def fss_metadata(path):
+    if not path:
+        return {}
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if str(payload.get("owner_uid")) != str(os.getuid()):
+        raise ValueError("FSS usage belongs to another user")
+    observed = datetime.fromisoformat(str(payload.get("observed_at", "")).replace("Z", "+00:00"))
+    if observed.tzinfo is None or observed > datetime.now(timezone.utc):
+        raise ValueError("FSS usage time must include a timezone and must not be in the future")
+    values = {}
+    for source, target in (("used_bytes", "fss_used_bytes"), ("files", "fss_files"),
+                           ("limit_bytes", "fss_limit_bytes")):
+        if source not in payload and source == "limit_bytes":
+            continue
+        value = int(payload[source])
+        if value < 0:
+            raise ValueError(f"FSS {source} must not be negative")
+        values[target] = str(value)
+    source = str(payload.get("source", "OCI FSS per-UID usage"))
+    if len(source) > 80 or any(ord(character) < 32 for character in source):
+        raise ValueError("FSS usage source label is invalid")
+    values.update(fss_observed_at=observed.isoformat(), fss_source=source)
+    return values
 
 
 def ensure_directory(db, path):
@@ -183,6 +209,7 @@ def publish(args):
         files = source_files(source)
         if destination.resolve() in files:
             raise ValueError("source and output must differ")
+        fss = fss_metadata(getattr(args, "fss_usage", None))
         before = signatures(files)
         with tempfile.TemporaryDirectory(prefix=".usage-work-") as scratch:
             # Build the report on worker-local scratch; copy it to FSS only
@@ -204,6 +231,7 @@ def publish(args):
                     "published_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     "source": str(source), "entries": str(count), "apparent_bytes": str(total),
                 }
+                metadata.update(fss)
                 db.executemany("INSERT INTO metadata VALUES (?, ?)", metadata.items())
                 db.commit()
             fd, destination_temporary = tempfile.mkstemp(
@@ -240,6 +268,7 @@ def main():
     parser.add_argument("--output", help="private SQLite report (default: ~/.gbi/usage.sqlite3)")
     parser.add_argument("--completed", action="store_true", help="confirm the inventory job finished successfully")
     parser.add_argument("--snapshot-at", required=True, help="original inventory timestamp with timezone, not conversion time")
+    parser.add_argument("--fss-usage", help="owner-scoped OCI FSS usage JSON")
     return publish(parser.parse_args())
 
 

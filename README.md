@@ -79,3 +79,34 @@ Fixture tests also exercise the GBI consumer when its library is on PYTHONPATH:
 PYTHONPATH=/path/to/GBI-Compute-Software-Modules/gbi/src/lib \
   python -m unittest discover -s tests -v
 ```
+
+## Schedule-ready collection
+
+`pipelines/run_usage.py` is the production boundary for one owner. Run it
+inside an allocated Slurm job; it calls the existing `stat_srun` collector,
+publishes only its completed JSONL, and writes `latest.json` only after the
+owner-scoped SQLite report succeeds:
+
+```sh
+uv run --project . python pipelines/run_usage.py \
+  --root /mnt/lustre/users/alice \
+  --inventory-dir /mnt/lustre/users/alice/.gbi/inventory \
+  --output /mnt/gbi-shared/home/alice/.gbi/usage.sqlite3
+```
+
+When the site collector has produced an owner-scoped OCI measurement, pass
+`--fss-usage /path/to/alice.json`. The JSON contract is `owner_uid`,
+`used_bytes`, `files`, `observed_at`, optional `limit_bytes`, and optional
+`source`. The publisher rejects foreign UIDs, negative counters, future or
+timezone-free observations, and control characters before replacing a report.
+
+The inventory directory is caller-owned mode 0700. A non-blocking shared lock
+rejects overlapping collections. Scanner or publisher failure removes only the
+unfinished inventory and leaves the previous report and completion manifest
+untouched. Each successful run retains its completed JSONL and records the
+snapshot time, paths and `LUSTRE_DLM_REVISION` in the manifest for Prefect.
+Temporary DuckDB and uv state must use worker-local `$TMPDIR`; the scheduled
+flow is responsible for supplying a pinned revision and explicit Slurm
+resources. A production image may set `LUSTRE_DLM_PYTHON` to an absolute,
+executable interpreter from its prebuilt environment; without that variable the
+collector retains the local `uv run --project` behavior.
