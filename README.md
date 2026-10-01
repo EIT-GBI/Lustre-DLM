@@ -104,7 +104,7 @@ provides `lustre-dlm-usage`, which sets `LUSTRE_DLM_PYTHON` and
 `LUSTRE_DLM_REVISION` before running this entrypoint:
 
 ```sh
-/mnt/gbi-shared/software/lustre-dlm/0.2.6/bin/lustre-dlm-usage \
+/mnt/gbi-shared/software/lustre-dlm/0.2.7/bin/lustre-dlm-usage \
   --root /mnt/lustre/users/OWNER \
   --inventory-dir /mnt/lustre/users/OWNER/.gbi/inventory \
   --output /mnt/gbi-shared/home/OWNER/.gbi/usage.sqlite3 \
@@ -130,7 +130,10 @@ When the site collector has produced an owner-scoped OCI measurement, pass
 `used_bytes`, `observed_at`, optional `files` (OCI quota accounting has no file
 count), optional `limit_bytes`, and optional `source`. The publisher rejects foreign UIDs, negative counters, future or
 timezone-free observations, and control characters before replacing a report.
-OCI FSS reports logical data bytes and excludes snapshots.
+OCI FSS reports logical data bytes and excludes snapshots. When the scheduler could not
+read OCI this week it passes `--fss-carry-forward` instead: the previous
+report's FSS values are kept unchanged (with their original observation time)
+and `fss_lookup_failed_at` records the failure.
 
 An owner may not be able to open every directory under their root (for
 example a service-owned folder). The scanner records such a directory as one

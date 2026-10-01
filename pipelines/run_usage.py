@@ -99,6 +99,7 @@ def run(args) -> Path:
                 "--completed", "--snapshot-at", snapshot_at,
                 *(["--fss-usage", str(Path(args.fss_usage).resolve())]
                   if args.fss_usage else []),
+                *(["--fss-carry-forward"] if getattr(args, "fss_carry_forward", False) else []),
             ], check=True)
             payload = {
                 "status": "complete", "snapshot_at": snapshot_at,
@@ -136,12 +137,16 @@ def main() -> int:
     parser.add_argument("--inventory-dir", required=True, help="private completed inventories and manifest")
     parser.add_argument("--output", required=True, help="owner-scoped SQLite usage report")
     parser.add_argument("--fss-usage", help="owner-scoped OCI FSS usage JSON")
+    parser.add_argument("--fss-carry-forward", action="store_true",
+                        help="FSS lookup failed this week: keep the previous FSS values")
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--processes", type=int, default=1)
     parser.add_argument("--nodes", type=int, default=1)
     parser.add_argument("--stat-command", help=argparse.SUPPRESS)
     parser.add_argument("--publisher", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.fss_usage and args.fss_carry_forward:
+        parser.error("pass either --fss-usage or --fss-carry-forward")
     if min(args.threads, args.processes, args.nodes) < 1:
         parser.error("threads, processes and nodes must be positive")
     try:
