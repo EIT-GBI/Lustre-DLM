@@ -104,7 +104,7 @@ provides `lustre-dlm-usage`, which sets `LUSTRE_DLM_PYTHON` and
 `LUSTRE_DLM_REVISION` before running this entrypoint:
 
 ```sh
-/mnt/gbi-shared/software/lustre-dlm/0.2.5/bin/lustre-dlm-usage \
+/mnt/gbi-shared/software/lustre-dlm/0.2.6/bin/lustre-dlm-usage \
   --root /mnt/lustre/users/OWNER \
   --inventory-dir /mnt/lustre/users/OWNER/.gbi/inventory \
   --output /mnt/gbi-shared/home/OWNER/.gbi/usage.sqlite3 \

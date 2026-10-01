@@ -49,7 +49,7 @@ def fake_slurm(tmp_path: Path) -> tuple[Path, Path]:
     return bin_dir, bin_dir / "srun"
 
 
-def invoke(tmp_path: Path, *, coordinator_status: int = 0, collector_status: int = 0, worker_status: int = 0, python: str | None = None, nodes: str = "fake-node", coordinator_delay: str = "0.1") -> tuple[subprocess.CompletedProcess, Path]:
+def invoke(tmp_path: Path, *, coordinator_status: int = 0, collector_status: int = 0, worker_status: int = 0, python: str | None = None, nodes: str = "fake-node", coordinator_delay: str = "0.1", extra_env: dict | None = None) -> tuple[subprocess.CompletedProcess, Path]:
     bin_dir, _ = fake_slurm(tmp_path)
     log = tmp_path / "events.log"
     marker = tmp_path / "collector.done"
@@ -65,6 +65,7 @@ def invoke(tmp_path: Path, *, coordinator_status: int = 0, collector_status: int
         "COLLECT_DELAY": "0.5",
         "FAKE_NODES": nodes,
         "COORD_DELAY": coordinator_delay,
+        **(extra_env or {}),
     })
     if python is not None:
         env["LUSTRE_DLM_PYTHON"] = python
@@ -172,3 +173,17 @@ def test_multi_node_allocation_keeps_workers_off_the_head_node(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     worker = next(line for line in log.read_text().splitlines() if line.startswith("args:worker:"))
     assert "--exact" in worker and "--exclude head-node" in worker
+
+
+def test_coordinator_gets_a_long_task_timeout(tmp_path: Path):
+    result, log = invoke(tmp_path)
+    assert result.returncode == 0, result.stderr
+    full = (Path(__file__).parents[1] / "stat_srun").read_text()
+    assert '--task-timeout "${LUSTRE_DLM_TASK_TIMEOUT:-21600}"' in full
+
+
+def test_collector_that_never_finishes_fails_closed_after_the_grace(tmp_path: Path):
+    result, log = invoke(tmp_path, extra_env={"COLLECT_DELAY": "30", "LUSTRE_DLM_COLLECT_GRACE": "1"})
+    assert result.returncode != 0
+    assert "collector did not finish" in result.stderr
+    assert "term:collect" in log.read_text().splitlines()
