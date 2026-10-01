@@ -104,6 +104,54 @@ def test_fss_measurement_without_file_count_is_published(tmp_path: Path):
     assert "fss_files" not in metadata and "fss_limit_bytes" not in metadata
 
 
+def test_failed_fss_lookup_carries_the_previous_measurement_forward(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    fss = tmp_path / "fss.json"
+    fss.write_text(json.dumps({
+        "owner_uid": os.getuid(), "used_bytes": 123,
+        "observed_at": "2026-09-20T00:00:00Z", "source": "OCI FSS quota accounting",
+    }))
+
+    def args(**extra):
+        return type("Args", (), {
+            "completed": True, "snapshot_at": "2026-09-27T00:00:00Z",
+            "root": str(root), "input": str(source), "output": str(output), **extra,
+        })
+
+    def metadata():
+        with closing(sqlite3.connect(output)) as db:
+            return dict(db.execute("SELECT key, value FROM metadata"))
+
+    assert usage.publish(args(fss_usage=str(fss))) == 0
+    assert usage.publish(args(fss_carry_forward=True)) == 0
+    carried = metadata()
+    assert carried["fss_used_bytes"] == "123"
+    assert carried["fss_observed_at"].startswith("2026-09-20")
+    assert "fss_lookup_failed_at" in carried
+    assert carried["snapshot_at"].startswith("2026-09-27")
+    # Carrying forward twice keeps the original observation, not the failure time.
+    assert usage.publish(args(fss_carry_forward=True)) == 0
+    assert metadata()["fss_observed_at"].startswith("2026-09-20")
+
+
+def test_failed_fss_lookup_without_a_previous_report_records_only_the_failure(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    args = type("Args", (), {
+        "completed": True, "snapshot_at": "2026-09-27T00:00:00Z", "root": str(root),
+        "input": str(source), "output": str(output), "fss_carry_forward": True,
+    })
+    assert usage.publish(args) == 0
+    with closing(sqlite3.connect(output)) as db:
+        metadata = dict(db.execute("SELECT key, value FROM metadata"))
+    assert "fss_lookup_failed_at" in metadata and "fss_used_bytes" not in metadata
+
+
 def test_foreign_or_invalid_fss_measurement_preserves_previous_report(tmp_path: Path):
     root = tmp_path / "alice"
     root.mkdir()

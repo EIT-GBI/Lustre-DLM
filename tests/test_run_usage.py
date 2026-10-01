@@ -60,6 +60,7 @@ class RunUsage(unittest.TestCase):
         self.assertTrue(Path(payload["inventory"]).is_file())
         self.assertEqual(run.call_count, 2)
         self.assertIn("--threads=4", run.call_args_list[0].args[0])
+        self.assertNotIn("--fss-carry-forward", run.call_args_list[1].args[0])
         self.assertEqual((payload["report_entries"], payload["report_apparent_bytes"]),
                          ("7", "4096"))
         self.assertGreater(payload["report_bytes"], 0)

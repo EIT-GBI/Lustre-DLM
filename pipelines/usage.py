@@ -79,6 +79,28 @@ def fss_metadata(path):
     return values
 
 
+def carried_fss_metadata(destination):
+    """Keep last week's FSS measurement when this week's lookup failed.
+
+    The scheduler could not read OCI this time, so the previous report's own
+    FSS values are copied forward unchanged (their observation time stays the
+    old one) and the failure is recorded, so the reader can say "lookup
+    failed, last known value N days old" instead of "not published".
+    """
+    failed = {"fss_lookup_failed_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    if not destination.exists():
+        return failed
+    try:
+        with closing(sqlite3.connect(f"{destination.as_uri()}?mode=ro", uri=True)) as db:
+            previous = dict(db.execute("SELECT key, value FROM metadata"))
+    except sqlite3.Error:
+        return failed
+    if previous.get("owner_uid") != str(os.getuid()) or "fss_used_bytes" not in previous:
+        return failed
+    keep = ("fss_used_bytes", "fss_files", "fss_limit_bytes", "fss_observed_at", "fss_source")
+    return {**{key: previous[key] for key in keep if key in previous}, **failed}
+
+
 def ensure_directory(db, path):
     """Create inferred ancestors without assuming the inventory listed each one."""
     while True:
@@ -233,7 +255,10 @@ def publish(args):
         files = source_files(source)
         if destination.resolve() in files:
             raise ValueError("source and output must differ")
-        fss = fss_metadata(getattr(args, "fss_usage", None))
+        if getattr(args, "fss_usage", None) and getattr(args, "fss_carry_forward", False):
+            raise ValueError("pass either --fss-usage or --fss-carry-forward")
+        fss = (carried_fss_metadata(destination) if getattr(args, "fss_carry_forward", False)
+               else fss_metadata(getattr(args, "fss_usage", None)))
         before = signatures(files)
         with tempfile.TemporaryDirectory(prefix=".usage-work-") as scratch:
             # Build the report on worker-local scratch; copy it to FSS only
@@ -295,6 +320,8 @@ def main():
     parser.add_argument("--completed", action="store_true", help="confirm the inventory job finished successfully")
     parser.add_argument("--snapshot-at", required=True, help="original inventory timestamp with timezone, not conversion time")
     parser.add_argument("--fss-usage", help="owner-scoped OCI FSS usage JSON")
+    parser.add_argument("--fss-carry-forward", action="store_true",
+                        help="this week's FSS lookup failed: keep the previous report's FSS values")
     return publish(parser.parse_args())
 
 
