@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -18,6 +19,21 @@ import textwrap
 import unittest
 
 PROJECT = Path(__file__).parents[1]
+def run(argv, env, timeout):
+    """Run a launcher in its own process group; a timeout kills every role."""
+    process = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        raise
+    if process.returncode:
+        raise subprocess.CalledProcessError(process.returncode, argv, stdout, stderr)
+    return stdout, stderr
+
+
 HAVE_RUNTIME = (
     importlib.util.find_spec("qpipe") is not None
     and importlib.util.find_spec("duckdb") is not None
@@ -56,22 +72,32 @@ class ScanEndToEnd(unittest.TestCase):
 
     def test_launcher_scans_every_entry(self):
         output = self.base / "scan.jsonl"
-        subprocess.run([str(PROJECT / "stat_srun"), f"--prefix={self.root}",
-                        f"--outfile={output}", "--threads=2"],
-                       env=self.env, check=True, timeout=120, capture_output=True)
+        run([str(PROJECT / "stat_srun"), f"--prefix={self.root}",
+             f"--outfile={output}", "--threads=2"], self.env, 120)
         paths = {json.loads(line)["path"] for line in output.read_text().splitlines()}
         self.assertTrue({str(self.root / "notes.txt"), str(self.root / "results" / "a.bin"),
                          str(self.root / "results" / "nested" / "b.bin")} <= paths)
 
     def test_two_collections_on_one_node_use_separate_pipes(self):
         outputs = [self.base / "a.jsonl", self.base / "b.jsonl"]
+        # Log to files: two chatty launchers on pipes read one after the other
+        # would block on a full pipe buffer.
+        logs = [(self.base / f"{output.stem}.log").open("wb") for output in outputs]
         runs = [subprocess.Popen([str(PROJECT / "stat_srun"), f"--prefix={self.root}",
                                   f"--outfile={output}", "--threads=2"],
-                                 env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                for output in outputs]
-        for run in runs:
-            _, stderr = run.communicate(timeout=120)
-            self.assertEqual(run.returncode, 0, stderr[-2000:])
+                                 env=self.env, stdout=subprocess.DEVNULL, stderr=log,
+                                 start_new_session=True)
+                for output, log in zip(outputs, logs)]
+        try:
+            for launcher, log in zip(runs, logs):
+                launcher.wait(timeout=120)
+                log.close()
+                self.assertEqual(launcher.returncode, 0,
+                                 Path(log.name).read_text(errors="replace")[-2000:])
+        finally:
+            for launcher in runs:
+                if launcher.poll() is None:
+                    os.killpg(launcher.pid, signal.SIGKILL)
         counts = [len(output.read_text().splitlines()) for output in outputs]
         self.assertEqual(counts[0], counts[1])
 
@@ -79,10 +105,9 @@ class ScanEndToEnd(unittest.TestCase):
         inventory = self.base / "inventory"
         report = self.base / "home" / ".gbi" / "usage.sqlite3"
         report.parent.mkdir(parents=True)
-        subprocess.run([sys.executable, str(PROJECT / "pipelines" / "run_usage.py"),
-                        "--root", str(self.root), "--inventory-dir", str(inventory),
-                        "--output", str(report), "--threads", "2"],
-                       env=self.env, check=True, timeout=180, capture_output=True)
+        run([sys.executable, str(PROJECT / "pipelines" / "run_usage.py"),
+             "--root", str(self.root), "--inventory-dir", str(inventory),
+             "--output", str(report), "--threads", "2"], self.env, 180)
         manifest = json.loads((inventory / "latest.json").read_text())
         self.assertEqual(manifest["status"], "complete")
         self.assertEqual(manifest["revision"], "test")
@@ -114,9 +139,8 @@ class UnreadableDirectory(ScanEndToEnd):
 
     def test_launcher_scans_every_entry(self):
         output = self.base / "scan.jsonl"
-        subprocess.run([str(PROJECT / "stat_srun"), f"--prefix={self.root}",
-                        f"--outfile={output}", "--threads=2"],
-                       env=self.env, check=True, timeout=120, capture_output=True)
+        run([str(PROJECT / "stat_srun"), f"--prefix={self.root}",
+             f"--outfile={output}", "--threads=2"], self.env, 120)
         records = {json.loads(line)["path"]: json.loads(line) for line in output.read_text().splitlines()}
         self.assertEqual(records[str(self.locked)]["code"], 13)
         self.assertNotIn(str(self.locked / "hidden.bin"), records)
@@ -125,10 +149,9 @@ class UnreadableDirectory(ScanEndToEnd):
         inventory = self.base / "inventory"
         report = self.base / "home" / ".gbi" / "usage.sqlite3"
         report.parent.mkdir(parents=True)
-        subprocess.run([sys.executable, str(PROJECT / "pipelines" / "run_usage.py"),
-                        "--root", str(self.root), "--inventory-dir", str(inventory),
-                        "--output", str(report), "--threads", "2"],
-                       env=self.env, check=True, timeout=180, capture_output=True)
+        run([sys.executable, str(PROJECT / "pipelines" / "run_usage.py"),
+             "--root", str(self.root), "--inventory-dir", str(inventory),
+             "--output", str(report), "--threads", "2"], self.env, 180)
         manifest = json.loads((inventory / "latest.json").read_text())
         self.assertEqual((manifest["report_status"], manifest["report_unreadable_directories"]),
                          ("partial", "1"))

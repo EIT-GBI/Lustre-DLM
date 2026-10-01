@@ -161,6 +161,9 @@ else
 fi
 
 # ---- slurm run ----
+# One task lists one directory. A directory of two million entries takes far
+# longer than qpipe's 300 s default on Lustre, and a re-dispatched listing
+# repeats work and results, so tasks get six hours (LUSTRE_DLM_TASK_TIMEOUT).
 # Several owners' collections can share one node, so each job takes three
 # free ports on the head node (where this batch script runs) instead of fixed
 # ones: a second job must never bind-fail and then talk to another job's pipes.
@@ -245,7 +248,7 @@ worker_status=0
 
 "${head_step[@]}"                                              \
     "${python_runner[@]}" ${__TARGET__} coordinator                       \
-    "$prefix" --wait 60                                                   \
+    "$prefix" --wait 60 --task-timeout "${LUSTRE_DLM_TASK_TIMEOUT:-21600}" \
     --work "0.0.0.0:$work_port" --completions "0.0.0.0:$completions_port" --results "0.0.0.0:$results_port" &
 coordinator_pid=$!
 
@@ -278,6 +281,17 @@ while :; do
     fi
     if [ "$coord_done" -eq 1 ] && [ "$collector_done" -eq 1 ]; then
         break
+    fi
+    # After a successful coordinator the collector only drains what is left.
+    # If it never sees the end of the stream, fail closed instead of holding
+    # the allocation until its time limit.
+    if [ "$coord_done" -eq 1 ]; then
+        coord_finished_at=${coord_finished_at:-$SECONDS}
+        if [ $((SECONDS - coord_finished_at)) -ge "${LUSTRE_DLM_COLLECT_GRACE:-600}" ]; then
+            echo "Error: collector did not finish within ${LUSTRE_DLM_COLLECT_GRACE:-600}s of the coordinator" >&2
+            collector_status=124
+            break
+        fi
     fi
     sleep 0.1
 done
