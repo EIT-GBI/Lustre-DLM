@@ -1,6 +1,6 @@
 [project]
 name = "luster-dlm"
-version = "0.1.0"
+version = "0.2.7"
 description = "Data Life Cycle management for Lustre and FSS"
 readme = "README.md"
 requires-python = ">=3.14"
@@ -8,3 +8,6 @@ dependencies = [
     "msgpack>=1.1.2",
     "qpipe-rs>=1.8.1"
 ]
+
+[project.optional-dependencies]
+usage = ["duckdb>=1.1"]

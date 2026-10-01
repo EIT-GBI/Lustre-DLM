@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 import argparse
@@ -58,6 +59,8 @@ def subdirs(it, result: Emit) -> Iterator[str]:
             ))
         except QpipeError:
             raise                        # pipe is gone: the harness must see it
+        except FileNotFoundError:
+            continue                     # removed since readdir: not in the tree
         except OSError:
             result(object_record(e.name, e.path, 1, object()))
 
@@ -65,8 +68,22 @@ def subdirs(it, result: Emit) -> Iterator[str]:
 def scan(spec: Spec, result: Emit, discover: Discover) -> None:
     """One readdir, one lstat per entry; at most DISCOVER_EVERY paths held."""
     path = spec.get("path", ".")
+    # Owners keep working while their tree is scanned: a directory removed
+    # after its parent was listed is simply no longer part of the tree.
     try:
         it = os.scandir(path)
+    except FileNotFoundError:
+        return
+    except PermissionError:
+        # An owner-run scan meets directories it may not open (for example a
+        # service-owned folder inside a home). Record the directory itself with
+        # the errno so the publisher can report the snapshot as partial.
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return
+        result(object_record(os.path.basename(path), path, errno.EACCES, info))
+        return
     except OSError as err:
         raise Permanent(f"cannot list '{path}': {err}") from err
 
@@ -74,7 +91,11 @@ def scan(spec: Spec, result: Emit, discover: Discover) -> None:
         for chunk in batched(subdirs(it, result), DISCOVER_EVERY):
             discover({"children": list(chunk)})
 
-    result(object_record(os.path.basename(path), path, 0, os.lstat(path)))
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    result(object_record(os.path.basename(path), path, 0, info))
 
 
 def make_coordinator(args: argparse.Namespace) -> Coordinator:

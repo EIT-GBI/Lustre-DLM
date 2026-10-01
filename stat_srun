@@ -143,27 +143,169 @@ done
 __resolve_prefix
 __resolve_target ${__PREFIX__}/pipelines/stat.py
 
+# Production images provide one prebuilt, revision-pinned environment. Local
+# development keeps the existing uv path. Refuse a relative or missing override
+# so a scheduled job cannot silently select another interpreter from PATH.
+if [[ -n "${LUSTRE_DLM_PYTHON:-}" ]]; then
+    [[ "$LUSTRE_DLM_PYTHON" == /* && -x "$LUSTRE_DLM_PYTHON" ]] || {
+        echo "Error: LUSTRE_DLM_PYTHON must be an absolute executable" >&2
+        exit 2
+    }
+    python_runner=("$LUSTRE_DLM_PYTHON")
+    # The bus spawns qpipe's `orchestrator` from PATH; it ships in the same
+    # environment's bin directory as the interpreter.
+    PATH="$(dirname -- "$LUSTRE_DLM_PYTHON"):$PATH"
+    export PATH
+else
+    python_runner=(uv run --project="$__PREFIX__" python)
+fi
+
 # ---- slurm run ----
-head_node=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -1)   
+# One task lists one directory. A directory of two million entries takes far
+# longer than qpipe's 300 s default on Lustre, and a re-dispatched listing
+# repeats work and results, so tasks get six hours (LUSTRE_DLM_TASK_TIMEOUT).
+# Several owners' collections can share one node, so each job takes three
+# free ports on the head node (where this batch script runs) instead of fixed
+# ones: a second job must never bind-fail and then talk to another job's pipes.
+read -r work_port completions_port results_port < <(python3 -c '
+import socket
+sockets = [socket.socket() for _ in range(3)]
+for s in sockets:
+    s.bind(("", 0))
+print(*(s.getsockname()[1] for s in sockets))
+')
+[[ -n "$results_port" ]] || { echo "Error: could not reserve pipe ports" >&2; exit 2; }
+head_node=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -1)
+allocated_nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | wc -l)
 
-srun --exact -N 1 -n 1 -w $head_node                                      \
-    uv run --project=${__PREFIX__} python ${__TARGET__} bus               \
+# A multi-node allocation keeps the head node for the bus, collector and
+# coordinator and runs workers everywhere else. A single-node allocation (one
+# owner's scheduled collection) has no "everywhere else": all roles then share
+# that node as overlapping steps, so a step never waits for another's memory.
+if [ "$allocated_nodes" -gt 1 ]; then
+    head_step=(srun --exact -N 1 -n 1 -w "$head_node")
+    worker_step=(srun --exact -N "$nodes" -n "$process" --exclude "$head_node")
+else
+    head_step=(srun --overlap -N 1 -n 1 -w "$head_node")
+    worker_step=(srun --overlap -N 1 -n "$process" -w "$head_node")
+fi
+
+"${head_step[@]}"                                                         \
+    "${python_runner[@]}" ${__TARGET__} bus                               \
     --wait 60                                                             \
-    --work 0.0.0.0:9101 --completions 0.0.0.0:9102 --results 0.0.0.0:9103 &
+    --work "0.0.0.0:$work_port" --completions "0.0.0.0:$completions_port" --results "0.0.0.0:$results_port" &
+bus_pid=$!
 
-srun --exact -N $nodes -n $process --exclude $head_node        \
-    uv run --project=${__PREFIX__} python ${__TARGET__} worker \
+"${worker_step[@]}"                                            \
+    "${python_runner[@]}" ${__TARGET__} worker                 \
         --threads $threads --wait 60                           \
-        --work $head_node:9101                                 \
-        --completions $head_node:9102                          \
-        --results $head_node:9103                              &
+        --work "$head_node:$work_port"                                \
+        --completions "$head_node:$completions_port"                         \
+    --results "$head_node:$results_port"                             &
+worker_pid=$!
 
-srun --exact -N 1 -n 1 -w $head_node                                      \
-    uv run --project=${__PREFIX__} python ${__TARGET__} collect           \
-    -o $outfile --wait 60                                                 \
-    --work 0.0.0.0:9101 --completions 0.0.0.0:9102 --results 0.0.0.0:9103 &
+"${head_step[@]}"                                                         \
+    "${python_runner[@]}" ${__TARGET__} collect                           \
+    -o "$outfile" --wait 60 --results "0.0.0.0:$results_port"      &
+collector_pid=$!
 
-srun --exact -N 1 -n 1 -w $head_node                                      \
-    uv run --project=${__PREFIX__} python ${__TARGET__} coordinator       \
-    $prefix --wait 60                                                     \
-    --work 0.0.0.0:9101 --completions 0.0.0.0:9102 --results 0.0.0.0:9103 &
+is_active() {
+    [ -n "$1" ] && kill -0 "$1" 2>/dev/null
+}
+
+terminate_owned() {
+    for pid in "$bus_pid" "$worker_pid" "$collector_pid" "$coordinator_pid"; do
+        if is_active "$pid"; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+}
+
+cleanup() {
+    status=$?
+    trap - EXIT INT TERM
+    terminate_owned
+    for pid in "$bus_pid" "$worker_pid" "$collector_pid" "$coordinator_pid"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    exit "$status"
+}
+on_interrupt() { exit 130; }
+on_terminate() { exit 143; }
+trap cleanup EXIT
+trap on_interrupt INT
+trap on_terminate TERM
+
+coordinator_pid=""
+coord_done=0
+collector_done=0
+bus_done=0
+worker_done=0
+coordinator_status=0
+collector_status=0
+bus_status=0
+worker_status=0
+
+"${head_step[@]}"                                              \
+    "${python_runner[@]}" ${__TARGET__} coordinator                       \
+    "$prefix" --wait 60 --task-timeout "${LUSTRE_DLM_TASK_TIMEOUT:-21600}" \
+    --work "0.0.0.0:$work_port" --completions "0.0.0.0:$completions_port" --results "0.0.0.0:$results_port" &
+coordinator_pid=$!
+
+reap_role() {
+    role_pid=$1
+    role_done=$2
+    role_status=$3
+    role_variable=$4
+    if [ "$(eval "printf '%s' \"\$$role_done\"")" -eq 0 ] && ! is_active "$role_pid"; then
+        if wait "$role_pid"; then
+            code=0
+        else
+            code=$?
+        fi
+        eval "$role_status=$code"
+        eval "$role_done=1"
+        eval "$role_variable=''"
+    fi
+}
+
+while :; do
+    reap_role "$coordinator_pid" coord_done coordinator_status coordinator_pid
+    reap_role "$collector_pid" collector_done collector_status collector_pid
+    reap_role "$bus_pid" bus_done bus_status bus_pid
+    reap_role "$worker_pid" worker_done worker_status worker_pid
+
+    if [ "$coordinator_status" -ne 0 ] || [ "$collector_status" -ne 0 ] || \
+       [ "$bus_status" -ne 0 ] || [ "$worker_status" -ne 0 ]; then
+        break
+    fi
+    if [ "$coord_done" -eq 1 ] && [ "$collector_done" -eq 1 ]; then
+        break
+    fi
+    # After a successful coordinator the collector only drains what is left.
+    # If it never sees the end of the stream, fail closed instead of holding
+    # the allocation until its time limit.
+    if [ "$coord_done" -eq 1 ]; then
+        coord_finished_at=${coord_finished_at:-$SECONDS}
+        if [ $((SECONDS - coord_finished_at)) -ge "${LUSTRE_DLM_COLLECT_GRACE:-600}" ]; then
+            echo "Error: collector did not finish within ${LUSTRE_DLM_COLLECT_GRACE:-600}s of the coordinator" >&2
+            collector_status=124
+            break
+        fi
+    fi
+    sleep 0.1
+done
+
+if [ "$coordinator_status" -ne 0 ]; then
+    exit "$coordinator_status"
+fi
+if [ "$collector_status" -ne 0 ]; then
+    exit "$collector_status"
+fi
+if [ "$bus_status" -ne 0 ]; then
+    exit "$bus_status"
+fi
+if [ "$worker_status" -ne 0 ]; then
+    exit "$worker_status"
+fi
+exit 0

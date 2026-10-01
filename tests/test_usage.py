@@ -1,0 +1,396 @@
+import importlib.util
+from contextlib import closing
+import sqlite3
+import json
+import os
+import tempfile
+import time
+import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
+from pathlib import Path
+
+import duckdb
+
+
+MODULE_PATH = Path(__file__).parents[1] / "pipelines" / "usage.py"
+spec = importlib.util.spec_from_file_location("usage", MODULE_PATH)
+usage = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(usage)
+
+
+def parquet(tmp_path: Path, root: Path, rows: int = 4) -> Path:
+    path = tmp_path / "inventory.parquet"
+    con = duckdb.connect()
+    con.execute("CREATE TABLE records(path VARCHAR, st_size BIGINT, code INTEGER)")
+    values = [(str(root), 100, 0), (str(root / "a%_file"), 10, 0),
+              (str(root / "nested"), 20, 0), (str(root / "nested" / "b"), 30, 0),
+              (str(root / "weird%_dir" / "file"), 7, 0)]
+    values.append((str(root.parent / "alice-other" / "foreign"), 999, 0))
+    con.executemany("INSERT INTO records VALUES (?, ?, ?)", values)
+    con.execute("INSERT INTO records SELECT ? || CAST(i AS VARCHAR), 1, 0 FROM range(?) rows(i)", [str(root / "bulk" / "f-"), rows])
+    con.execute("COPY records TO ? (FORMAT PARQUET)", [str(path)])
+    con.close()
+    return path
+
+
+def publish(source: Path, root: Path, output: Path, snapshot="2026-09-20T00:00:00Z"):
+    args = type("Args", (), {"completed": True, "snapshot_at": snapshot,
+                              "root": str(root), "input": str(source),
+                              "output": str(output), "fss_usage": None})
+    return usage.publish(args)
+
+
+def test_rollup_literal_paths_and_foreign_root_filter(tmp_path: Path):
+    root = tmp_path / "ali'ce%_"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    assert publish(source, root, output) == 0
+    with closing(sqlite3.connect(output)) as db:
+        metadata = dict(db.execute("SELECT key, value FROM metadata"))
+        assert metadata["schema_version"] == "1" and metadata["owner_uid"] == str(os.getuid())
+        assert metadata["snapshot_at"] == "2026-09-20T00:00:00+00:00"
+        assert metadata["published_at"] != metadata["snapshot_at"]
+        assert db.execute("SELECT apparent_bytes FROM directories WHERE path='.'").fetchone() == (171,)
+        assert db.execute("SELECT apparent_bytes FROM directories WHERE path='nested'").fetchone() == (50,)
+        assert db.execute("SELECT apparent_bytes FROM directories WHERE path=?", ("weird%_dir",)).fetchone() == (7,)
+
+
+def test_owner_scoped_fss_measurement_is_published(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    fss = tmp_path / "fss.json"
+    fss.write_text(json.dumps({
+        "owner_uid": os.getuid(), "used_bytes": 123, "files": 4,
+        "limit_bytes": 1000, "observed_at": "2026-09-20T00:00:00Z",
+        "source": "OCI FSS per-UID usage",
+    }))
+    args = type("Args", (), {
+        "completed": True, "snapshot_at": "2026-09-20T00:00:00Z",
+        "root": str(root), "input": str(source), "output": str(output),
+        "fss_usage": str(fss),
+    })
+    assert usage.publish(args) == 0
+    with closing(sqlite3.connect(output)) as db:
+        metadata = dict(db.execute("SELECT key, value FROM metadata"))
+    assert metadata["fss_used_bytes"] == "123"
+    assert metadata["fss_files"] == "4"
+    assert metadata["fss_limit_bytes"] == "1000"
+    assert metadata["fss_source"] == "OCI FSS per-UID usage"
+
+
+def test_fss_measurement_without_file_count_is_published(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    fss = tmp_path / "fss.json"
+    fss.write_text(json.dumps({
+        "owner_uid": os.getuid(), "used_bytes": 123,
+        "observed_at": "2026-09-20T00:00:00Z", "source": "OCI FSS quota accounting",
+    }))
+    args = type("Args", (), {
+        "completed": True, "snapshot_at": "2026-09-20T00:00:00Z",
+        "root": str(root), "input": str(source), "output": str(output),
+        "fss_usage": str(fss),
+    })
+    assert usage.publish(args) == 0
+    with closing(sqlite3.connect(output)) as db:
+        metadata = dict(db.execute("SELECT key, value FROM metadata"))
+    assert metadata["fss_used_bytes"] == "123"
+    assert "fss_files" not in metadata and "fss_limit_bytes" not in metadata
+
+
+def test_failed_fss_lookup_carries_the_previous_measurement_forward(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    fss = tmp_path / "fss.json"
+    fss.write_text(json.dumps({
+        "owner_uid": os.getuid(), "used_bytes": 123,
+        "observed_at": "2026-09-20T00:00:00Z", "source": "OCI FSS quota accounting",
+    }))
+
+    def args(**extra):
+        return type("Args", (), {
+            "completed": True, "snapshot_at": "2026-09-27T00:00:00Z",
+            "root": str(root), "input": str(source), "output": str(output), **extra,
+        })
+
+    def metadata():
+        with closing(sqlite3.connect(output)) as db:
+            return dict(db.execute("SELECT key, value FROM metadata"))
+
+    assert usage.publish(args(fss_usage=str(fss))) == 0
+    assert usage.publish(args(fss_carry_forward=True)) == 0
+    carried = metadata()
+    assert carried["fss_used_bytes"] == "123"
+    assert carried["fss_observed_at"].startswith("2026-09-20")
+    assert "fss_lookup_failed_at" in carried
+    assert carried["snapshot_at"].startswith("2026-09-27")
+    # Carrying forward twice keeps the original observation, not the failure time.
+    assert usage.publish(args(fss_carry_forward=True)) == 0
+    assert metadata()["fss_observed_at"].startswith("2026-09-20")
+
+
+def test_failed_fss_lookup_without_a_previous_report_records_only_the_failure(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    args = type("Args", (), {
+        "completed": True, "snapshot_at": "2026-09-27T00:00:00Z", "root": str(root),
+        "input": str(source), "output": str(output), "fss_carry_forward": True,
+    })
+    assert usage.publish(args) == 0
+    with closing(sqlite3.connect(output)) as db:
+        metadata = dict(db.execute("SELECT key, value FROM metadata"))
+    assert "fss_lookup_failed_at" in metadata and "fss_used_bytes" not in metadata
+
+
+def test_foreign_or_invalid_fss_measurement_preserves_previous_report(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    assert publish(source, root, output) == 0
+    previous = output.read_bytes()
+    fss = tmp_path / "fss.json"
+    for payload in [
+        {"owner_uid": os.getuid() + 1, "used_bytes": 1, "files": 1,
+         "observed_at": "2026-09-20T00:00:00Z"},
+        {"owner_uid": os.getuid(), "used_bytes": -1, "files": 1,
+         "observed_at": "2026-09-20T00:00:00Z"},
+        {"owner_uid": os.getuid(), "used_bytes": 1, "files": 1,
+         "observed_at": "2999-01-01T00:00:00Z"},
+    ]:
+        fss.write_text(json.dumps(payload))
+        args = type("Args", (), {
+            "completed": True, "snapshot_at": "2026-09-20T00:00:00Z",
+            "root": str(root), "input": str(source), "output": str(output),
+            "fss_usage": str(fss),
+        })
+        assert usage.publish(args) == 2
+        assert output.read_bytes() == previous
+
+
+def test_selected_inventory_is_lazy_and_treats_root_literally(tmp_path: Path):
+    con = duckdb.connect()
+    con.execute("CREATE TABLE inventory(path VARCHAR, st_size BIGINT, code INTEGER)")
+    root = "/ali'ce%_"
+    con.executemany("INSERT INTO inventory VALUES (?, ?, ?)", [
+        (root, 100, 0), (root + "/a", 10, 0), (root + "-other/b", 999, 0),
+    ])
+    usage.select_inventory(con, root)
+    assert con.execute("SELECT path FROM selected ORDER BY path").fetchall() == [
+        (root,), (root + "/a",)
+    ]
+    assert con.execute("SELECT view_name FROM duckdb_views() WHERE view_name='selected'").fetchone() == ("selected",)
+    con.execute("INSERT INTO inventory VALUES (?, ?, ?)", (root + "/new", 4, 0))
+    assert con.execute("SELECT path FROM selected ORDER BY path").fetchall() == [
+        (root,), (root + "/a",), (root + "/new",)
+    ]
+    con.close()
+
+
+def test_errors_preserve_previous_complete(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    assert publish(source, root, output) == 0
+    previous = output.read_bytes()
+    con = duckdb.connect()
+    con.execute("CREATE TABLE records(path VARCHAR, st_size BIGINT, code INTEGER)", [])
+    con.execute("INSERT INTO records VALUES (?, ?, ?)", [str(root / "bad"), 1, 1])
+    bad_source = tmp_path / "bad.parquet"
+    con.execute("COPY records TO ? (FORMAT PARQUET)", [str(bad_source)])
+    con.close()
+    assert publish(bad_source, root, output) == 2
+    assert output.read_bytes() == previous
+
+
+def test_large_fixture_is_stream_aggregation_shape(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root, rows=100_000)
+    output = tmp_path / "usage.sqlite3"
+    started = time.monotonic()
+    assert publish(source, root, output) == 0
+    print(f"100000-entry publication seconds: {time.monotonic() - started:.3f}")
+    with closing(sqlite3.connect(output)) as db:
+        assert db.execute("SELECT entries FROM directories WHERE path='bulk'").fetchone() == (100_000,)
+
+
+def test_source_mutation_does_not_publish(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    real_signatures = usage.signatures
+    calls = 0
+
+    def changing(files):
+        nonlocal calls
+        calls += 1
+        value = real_signatures(files)
+        return value if calls == 1 else value[:-1] + [("new-partition", 1, 2, 3, 4)]
+
+    with patch.object(usage, "signatures", changing):
+        assert publish(source, root, output) == 2
+    assert not output.exists()
+
+
+def test_source_mutation_during_copy_does_not_publish(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    assert publish(source, root, output) == 0
+    previous = output.read_bytes()
+    real_signatures = usage.signatures
+    calls = 0
+
+    def changing(files):
+        nonlocal calls
+        calls += 1
+        value = real_signatures(files)
+        return value if calls < 3 else value[:-1] + [("changed-during-copy", 1, 2, 3, 4)]
+
+    with patch.object(usage, "signatures", changing):
+        assert publish(source, root, output) == 2
+    assert output.read_bytes() == previous
+    assert not list(output.parent.glob(".usage-*.sqlite3"))
+
+
+def test_copy_failure_preserves_previous_report(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    assert publish(source, root, output) == 0
+    previous = output.read_bytes()
+
+    with patch.object(usage.shutil, "copyfileobj", side_effect=OSError("copy failed")):
+        assert publish(source, root, output) == 2
+    assert output.read_bytes() == previous
+    assert not list(output.parent.glob(".usage-*.sqlite3"))
+
+
+def test_directory_metadata_rolls_up_across_batches(tmp_path: Path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    rows = [{"path": str(root), "st_size": 13, "code": 0}]
+    for index in range(2500):
+        directory = root / f"folder-{index}"
+        rows.extend([{"path": str(directory), "st_size": 3, "code": 0},
+                     {"path": str(directory / "file"), "st_size": 7, "code": 0}])
+    source = tmp_path / "inventory.jsonl"
+    source.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    output = tmp_path / "usage.sqlite3"
+    assert publish(source, root, output) == 0
+    with closing(sqlite3.connect(output)) as db:
+        assert db.execute("SELECT apparent_bytes, entries FROM directories WHERE path='.'").fetchone() == (25013, 5001)
+        assert db.execute("SELECT apparent_bytes, entries FROM directories WHERE path='folder-2499'").fetchone() == (10, 2)
+        assert db.execute("SELECT count(*) FROM directories").fetchone() == (2501,)
+
+
+def test_missing_ancestors_and_client_contract(tmp_path):
+    try:
+        from gbi_data import usage as client
+    except ModuleNotFoundError as error:
+        if error.name != "gbi_data":
+            raise
+        raise unittest.SkipTest("set PYTHONPATH to run the optional GBI consumer check") from error
+    root = tmp_path.resolve() / "alice"
+    root.mkdir()
+    output = root / ".gbi" / "usage.sqlite3"
+    source = tmp_path / "inventory.jsonl"
+    source.write_text(json.dumps({"path": str(root / "a" / "b" / "c" / "file"), "st_size": 17, "code": 0}) + "\n")
+    assert publish(source, root, output) == 0
+    site = SimpleNamespace(user="alice", values={"usage_db": str(output), "lfs_bin": "absent-lfs"}, roots={"lustre": root}, path=tmp_path / "site.conf")
+    report = client.report(site, None, 4, 20)
+    assert report["summary"] == (17, 1)
+    assert report["rows"] == [("a", 17, 1), ("a/b", 17, 1), ("a/b/c", 17, 1)]
+    assert (output.stat().st_mode & 0o777) == 0o600
+    assert not list(output.parent.glob("*-wal"))
+
+
+def test_invalid_snapshot_preserves_report(tmp_path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    assert publish(source, root, output) == 0
+    previous = output.read_bytes()
+    for timestamp in ["later", "2026-09-20", "2999-01-01T00:00:00Z"]:
+        assert publish(source, root, output, timestamp) == 2
+        assert output.read_bytes() == previous
+
+
+def test_invalid_selected_rows_preserve_report(tmp_path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    assert publish(source, root, output) == 0
+    previous = output.read_bytes()
+    bad = tmp_path / "bad.jsonl"
+    for row in [
+        {"path": str(root / "file"), "code": 0, "st_size": None},
+        {"path": str(root / "file"), "code": None, "st_size": 1},
+        {"path": str(root / "file"), "code": 0, "st_size": -1},
+        {"path": str(root) + "/../elsewhere", "code": 0, "st_size": 1},
+    ]:
+        bad.write_text(json.dumps(row) + "\n")
+        assert publish(bad, root, output) == 2
+        assert output.read_bytes() == previous
+
+
+def test_malformed_input_preserves_previous_report(tmp_path):
+    root = tmp_path / "alice"
+    root.mkdir()
+    source = parquet(tmp_path, root)
+    output = tmp_path / "usage.sqlite3"
+    assert publish(source, root, output) == 0
+    previous = output.read_bytes()
+    malformed = tmp_path / "malformed.jsonl"
+    malformed.write_text("{unfinished\n")
+    assert publish(malformed, root, output) == 2
+    assert output.read_bytes() == previous
+
+
+class Publications(unittest.TestCase):
+    pass
+
+
+def case(function):
+    def run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            function(Path(directory))
+    return run
+
+
+for name, function in list(globals().items()):
+    if name.startswith("test_"):
+        setattr(Publications, name, case(function))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+def test_duckdb_memory_follows_the_slurm_allocation(monkeypatch):
+    monkeypatch.delenv("LUSTRE_DLM_DUCKDB_MEMORY", raising=False)
+    monkeypatch.delenv("SLURM_MEM_PER_NODE", raising=False)
+    assert usage.duckdb_memory_limit() == "512MB"
+    monkeypatch.setenv("SLURM_MEM_PER_NODE", "32768")
+    assert usage.duckdb_memory_limit() == "13107MB"
+    monkeypatch.setenv("SLURM_MEM_PER_NODE", "1024")
+    assert usage.duckdb_memory_limit() == "512MB"
+    monkeypatch.setenv("LUSTRE_DLM_DUCKDB_MEMORY", "2GB")
+    assert usage.duckdb_memory_limit() == "2GB"
