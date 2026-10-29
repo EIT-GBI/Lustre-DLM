@@ -8,15 +8,27 @@ using Pkg
 Pkg.activate(joinpath(@__DIR__, ".."))
 
 using PackageCompiler
-outdir = isempty(ARGS) ? normpath(joinpath(@__DIR__, "..", "..", "build")) : abspath(ARGS[1])
+default = normpath(joinpath(@__DIR__, "..", "..", "build"))
+outdir  = isempty(ARGS) ? default : abspath(ARGS[1])
 
 const APPDIRS = ["bin", "lib", "libexec", "share"]
-# unmistakably a finished app of this script (not e.g. a prefix like ~/.local
-# with bin/ProcessStat)
-isbuild(d) = isfile(joinpath(d, "lib", "julia", "sys." * Base.Libc.Libdl.dlext))                     &&
-             isfile(joinpath(d, "bin", "ProcessStat")) && !islink(joinpath(d, "bin", "ProcessStat")) &&
-             readdir(d) ⊆ APPDIRS && readdir(joinpath(d, "bin")) ⊆ ["ProcessStat", "julia"]          &&
-             isdir(joinpath(d, "share")) && readdir(joinpath(d, "share")) ⊆ ["julia"]
+
+"""
+    isbuild(d) -> Bool
+
+Whether the directory `d` is unmistakably a finished app of this script (and
+not e.g. a prefix like `~/.local` that happens to hold `bin/ProcessStat`).
+"""
+isbuild(d) = (
+    isfile(joinpath(d, "lib", "julia", "sys." * Base.Libc.Libdl.dlext)) &&
+    isfile(joinpath(d, "bin", "ProcessStat"))                           &&
+    !islink(joinpath(d, "bin", "ProcessStat"))                          &&
+    readdir(d) ⊆ APPDIRS                                                &&
+    readdir(joinpath(d, "bin")) ⊆ ["ProcessStat", "julia"]              &&
+    isdir(joinpath(d, "share"))                                         &&
+    readdir(joinpath(d, "share")) ⊆ ["julia"]
+)
+
 # the default ProcessStat/build (gitignored) belongs to this script, also when
 # a build was cut short
 force = isdir(outdir) && (

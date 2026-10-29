@@ -1,7 +1,15 @@
+"""
+    App
+
+The command-line front end of `ProcessStat`, compiled into an executable by
+`deps/build.jl`: `julia_main` parses the arguments (`USAGE` lists them) and
+calls `ProcessStat.convert_file`.
+"""
 module App
 
 using ProcessStat
 
+"The help text; also the summary of the options `parse_args` understands."
 const USAGE = """
 usage: ProcessStat [options] input.jsonl outdir
 
@@ -17,12 +25,24 @@ it does not grow with the file size or with the thread count beyond --inflight.
 Options go before --julia-args. For multi-threading use: `--julia-args -t<number of threads>`
 """
 
-const INTFLAGS = Dict("--chunk-mb" => :chunk_mb, "--inflight" => :inflight, "--window" => :window)
+"The integer options and the `convert_file` keyword each one sets."
+const INTFLAGS = Dict(
+    "--chunk-mb" => :chunk_mb,
+    "--inflight" => :inflight,
+    "--window"   => :window
+)
 
-# Returns (positional, kwargs) or throws ArgumentError.
+"""
+    parse_args(args) -> (positional, kwargs)
+
+Split `args` into the two positional arguments (input file and outdir) and the
+keyword arguments for `ProcessStat.convert_file`. Throws an `ArgumentError`
+whose message is to be shown, or whose message is `"help"` for `-h`/`--help`.
+"""
 function parse_args(args::Vector{String})
-    pos, kw = String[], Dict{Symbol,Any}()
-    i = 1
+    pos = String[]
+    kw  = Dict{Symbol,Any}()
+    i   = 1
     while i <= length(args)
         a = args[i]
         if a in ("-h", "--help")
@@ -58,6 +78,13 @@ function parse_args(args::Vector{String})
     return pos, (; kw...)
 end
 
+"""
+    julia_main() -> Cint
+
+Entry point of the compiled app: parse `ARGS`, run the conversion and return
+the exit status, 0 on success and 1 on a usage error or a failed conversion
+(which leaves `code_0.arrow.partial` behind).
+"""
 function julia_main()::Cint
     # With no interactive thread (-t1, JULIA_NUM_THREADS=1, -tN,0) ^C would be
     # thrown into whatever task runs on thread 1, usually a worker, where it
@@ -65,18 +92,19 @@ function julia_main()::Cint
     # stays. (Not unconditionally: a ^C that lands during JIT can then deadlock
     # the exit path.)
     Threads.nthreads(:interactive) == 0 && Base.exit_on_sigint(true)
+
     pos, kw = try
         parse_args(ARGS)
     catch e
         help = e isa ArgumentError && e.msg == "help"
-        help || println(
-            stderr, "error: ", e isa ArgumentError ? e.msg : sprint(
-                showerror, e
-            )
-        )
+        if !help
+            msg = e isa ArgumentError ? e.msg : sprint(showerror, e)
+            println(stderr, "error: ", msg)
+        end
         print(help ? stdout : stderr, USAGE)
         return help ? 0 : 1
     end
+
     try
         ProcessStat.convert_file(pos[1], pos[2]; kw...)
     catch
